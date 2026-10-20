@@ -4,8 +4,6 @@
 
 本仓库是一个技能集：`shared/` 是共享内核，`skills/` 下每个子目录是独立子技能。
 
-仓库地址：<https://github.com/rookiebug1216/doubao-video-skill>
-
 它不调用豆包 API，而是通过 CDP 驱动本地 Chromium 浏览器打开**豆包网页版**（doubao.com），像真人一样在对话框输入提示词、上传参考图、等待生成并下载结果。因此不需要申请 API Key，也不需要安装任何浏览器插件，生成脚本零第三方 pip 依赖。
 
 ---
