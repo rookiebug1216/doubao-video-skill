@@ -23,7 +23,7 @@
 
 ![烟雨剑归演示](tests/e2e_project_mode/烟雨剑归/output/preview.gif)
 
-[观看完整视频](tests/e2e_project_mode/烟雨剑归/output/烟雨剑归_镜1-2_拼接.mp4)（86MB）
+[观看完整视频](https://github.com/rookiebug1216/doubao-video-skill/releases/download/v1.0.0/demo-full.mp4)（约 87MB，托管在 Releases）
 
 ## 环境要求
 
