@@ -1,0 +1,71 @@
+# ── 用户运行时数据 ──
+workspace/
+projects/
+out/
+manju_out/
+manju_videos/
+char_refs/
+
+# ── 内部开发记录 ──
+.workbuddy/
+
+# ── 旧测试目录（已迁移到项目根目录模式） ──
+tests/e2e_out/
+tests/e2e_out_v2/
+tests/e2e_out_v3/
+tests/e2e_two_shots/
+tests/manual/
+tests/mock_cdp/__pycache__/
+tests/unit/__pycache__/
+tests/e2e/__pycache__/
+tests/__pycache__/
+
+# ── workspace/ 下的运行时产物 ──
+workspace/**/*.shots.json
+workspace/**/*.storyboard.md
+workspace/**/*.prompts.txt
+workspace/**/*.voiceover.md
+workspace/**/*.characters.json
+workspace/**/char_refs_index.json
+workspace/**/keyframes_state.json
+workspace/**/shot_*.mp4
+workspace/**/shot_*_首帧.png
+workspace/**/shot_*_尾帧.png
+workspace/**/*_六视图.png
+workspace/**/*_reference.png
+
+# ── 诊断/调试文件（任何位置） ──
+login-wall.png
+login-wall.dom.json
+probe.png
+probe_*.png
+probe_*.dom.json
+*_timeout.png
+*_timeout.dom.json
+concat_list.txt
+*.dom.json
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# ── IDE / 编辑器 ──
+.trae/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── 日志 ──
+*.log

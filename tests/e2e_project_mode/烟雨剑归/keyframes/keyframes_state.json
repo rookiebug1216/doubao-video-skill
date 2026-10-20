@@ -1,0 +1,10 @@
+{
+  "1": {
+    "start_frame": "shot_01_首帧.png",
+    "end_frame": "shot_01_尾帧.png"
+  },
+  "2": {
+    "start_frame": "shot_01_尾帧.png",
+    "end_frame": "shot_02_尾帧.png"
+  }
+}

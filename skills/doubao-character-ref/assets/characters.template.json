@@ -1,0 +1,60 @@
+{
+  "project": "雨夜来客",
+  "style": "3d-realistic",
+  "characters": [
+    {
+      "name": "苏见川",
+      "aliases": ["苏剑客", "见川"],
+      "importance": "protagonist",
+      "desc": "三十岁男性，颧骨分明，下颌线硬朗，剑眉星眸，留短寸黑发，鬓角剃青，穿深灰色立领长风衣，内搭黑色高领毛衣，腰悬半月形白玉佩，穿红丝穗，黑色长靴，体型修长挺拔",
+      "persona": {
+        "age": "约30岁",
+        "gender": "男",
+        "body": "修长挺拔，身高约180cm",
+        "face": "颧骨分明，下颌线硬朗，剑眉星眸",
+        "hair": "短寸黑发，鬓角剃青",
+        "clothing": "深灰色立领长风衣，内搭黑色高领毛衣，腰束玉带，黑色长靴",
+        "props": ["半月形白玉佩"],
+        "distinguishing": "右眉尾有一道浅疤"
+      },
+      "generic_identity": {
+        "video_term": "深灰长风衣、短寸黑发的青年剑客",
+        "frame_term": "苏见川（约30岁，剑眉星眸，短寸黑发，深灰立领长风衣，腰悬白玉佩）"
+      }
+    },
+    {
+      "name": "林晚",
+      "aliases": ["林姑娘"],
+      "importance": "major",
+      "desc": "二十五岁女性，鹅蛋脸，柳眉杏眼，鼻梁挺秀，长发及腰微卷自然棕黑色，穿白色棉麻长裙，外搭米色针织开衫，脚踩棕色软皮短靴，气质温婉，体型纤细",
+      "persona": {
+        "age": "约25岁",
+        "gender": "女",
+        "body": "纤细修长，身高约165cm",
+        "face": "鹅蛋脸，柳眉杏眼，鼻梁挺秀",
+        "hair": "长发及腰，微卷，自然棕黑色",
+        "clothing": "白色棉麻长裙，外搭米色针织开衫，棕色软皮短靴",
+        "props": [],
+        "distinguishing": "气质温婉"
+      },
+      "generic_identity": {
+        "video_term": "白裙棕黑长发的温婉女子",
+        "frame_term": "林晚（约25岁，柳眉杏眼，长发及腰棕黑，白色棉麻长裙，米色针织开衫）"
+      }
+    }
+  ],
+  "props": [
+    {
+      "name": "玉佩",
+      "aliases": ["白玉佩"],
+      "desc": "半月形白玉佩，表面雕云纹，边缘温润有包浆，穿红丝穗，古风挂件，约掌心大小"
+    }
+  ],
+  "_schema_doc": {
+    "characters[].importance": "protagonist | major | minor",
+    "characters[].persona": "结构化外形字段，用于六视图提示词",
+    "characters[].generic_identity.video_term": "视频正文通用身份（禁角色名）",
+    "characters[].generic_identity.frame_term": "分镜图角色名+核心特征绑定（指向设定图）",
+    "characters[].desc": "兼容旧版的自由文本描述，无 persona 时退化为唯一来源"
+  }
+}

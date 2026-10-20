@@ -1,0 +1,15 @@
+{
+  "project": "烟雨剑归",
+  "style": "3d-realistic",
+  "total": 1,
+  "completed": 1,
+  "results": [
+    {
+      "type": "character",
+      "name": "苏见川",
+      "desc": "三十岁男性，颧骨分明，下颌线硬朗，剑眉星眸，留短寸黑发，鬓角剃青，穿深灰色立领长风衣，内搭黑色高领毛衣，腰悬半月形白玉佩，穿红丝穗，黑色长靴，体型修长挺拔",
+      "status": "ok",
+      "path": "苏见川_六视图.png"
+    }
+  ]
+}
