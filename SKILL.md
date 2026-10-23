@@ -25,7 +25,7 @@ doubao-video-skill/
 ├── shared/                      # 共享内核（平台能力，与风格无关）
 │   ├── cdp_browser.py           #   CDP 客户端 + 浏览器发现/拉起/标签页
 │   ├── doubao_page.py           #   豆包页面操作原语（就绪/登录/填入/提交/诊断）
-│   ├── imagegen.py              #   图生图引擎（渲染检测/五级无水印下载/generate_one）
+│   ├── imagegen.py              #   图生图引擎（渲染检测/双档下载（无水印原图优先/带水印兜底，不截图）/generate_one）
 │   ├── media_unlock.py          #   视频无水印下载（fallback_api 解密链路）
 │   ├── style_presets.py         #   画风预设（所有 skill 统一，防风格漂移）
 │   └── video_utils.py           #   视频文件工具

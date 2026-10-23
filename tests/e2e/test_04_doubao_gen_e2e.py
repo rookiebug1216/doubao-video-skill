@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Step 4：视频生成 + 无水印下载验证（消耗 1 次额度）。
+Step 4：视频生成 + 无水印下载验证（需 --unlock）（消耗 1 次额度）。
 
 前置：
   - Step 3 全绿（first_char_ref_path fixture 校验通过）
@@ -44,6 +44,7 @@ def _run_doubao_gen():
         "--char-refs", char_refs,
         "--only", "1",
         "--keep-tab",
+        "--unlock",
     ]
     # 渲染超时 15 分钟，加 buffer 取 25 分钟
     return subprocess.run(cmd, cwd=_ROOT, capture_output=True, text=True,
@@ -108,8 +109,8 @@ def test_mp4_size_gt_1mb(video_path):
 
 def test_mp4_size_suggests_unwatermarked(video_path):
     """
-    软断言：无水印链路文件应 > 5MB（明显大于带水印版的 1.25MB）。
-    小于则打警告但不 fail（保守起见）。
+    软断言：无水印链路文件应 > 5MB。
+    带水印版约 1.25MB，无水印约 29MB；小于 5MB 则打警告但不 fail（保守起见）。
     """
     size = os.path.getsize(video_path)
     if size < 5 * 1024 * 1024:
@@ -120,7 +121,8 @@ def test_mp4_size_suggests_unwatermarked(video_path):
 def test_unlock_chain_logged(gen_result):
     """日志含无水印链路字样。"""
     log = (gen_result.stdout or "") + (gen_result.stderr or "")
-    assert ("无水印直链已解析" in log) or ("已通过无水印链路下载" in log), (
+    assert (("无水印直链已解析" in log) or ("已通过无水印链路下载" in log)
+            or ("已下载无水印原片" in log)), (
         "CLI 日志未出现无水印链路字样，可能走了带水印降级策略"
     )
 

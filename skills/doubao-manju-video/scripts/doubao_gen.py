@@ -41,7 +41,7 @@ from shared import cdp_browser, doubao_page, style_presets, media_unlock
 from shared.cdp_browser import CDPPage, CDPError, DOUBAO_HOME, _OPENER, log, cookie_header
 from shared.doubao_page import (
     page_ready, login_state, is_logged_in, wait_login,
-    fill_prompt, submit_prompt, diag_snapshot, new_conversation,
+    fill_prompt, submit_prompt, diag_snapshot, new_conversation, upload_images,
 )
 from shared.project_manager import ProjectManager, resolve_output_dir
 
@@ -161,6 +161,10 @@ REPLY_STATE_JS = """
   // 最新一张「视频生成参数确认」卡（豆包渲染前必先回复参数卡求确认）
   const i=t.lastIndexOf('视频生成参数确认');
   const hasCard = i>=0 || /确认后我再(开始|为你)/.test(t);
+  // 确认轮次计数：豆包可能「确认后再次回复一张新参数卡」要求二次确认，
+  // 用标题/催确认句的累计出现次数区分“新的一张卡”与“同一张卡流式更新”。
+  const cardTitles=(t.match(/视频生成参数确认/g)||[]).length;
+  const askCount=(t.match(/确认后我再(开始|为你)/g)||[]).length;
   const card = i>=0 ? t.slice(i, Math.min(t.length, i+700)) : '';
   // 真正的额度耗尽（无"是否继续生成"按钮的纯文案，应终止整批）
   // 注意：付费询问"今日免费额度已用完，本次将消耗付费额度。是否继续生成？"不算 error，
@@ -176,7 +180,8 @@ REPLY_STATE_JS = """
   }
   // 豆包回复尾部 600 字符，供主循环实时监控打印（按句去重，避免日志爆炸）
   const replyTail=t.slice(-600);
-  return JSON.stringify({hasCard, card, cardIdx: i, errors, paidPrompt, replyTail});
+  return JSON.stringify({hasCard, card, cardIdx: i, cardTitles, askCount,
+    errors, paidPrompt, replyTail});
 })()
 """
 
@@ -340,6 +345,26 @@ def send_confirmation(page: CDPPage, allow_text: bool = True) -> str:
     return "none"
 
 
+def _confirm_round_key(state: dict) -> tuple:
+    """把一次「要求确认」映射成轮次键，用于去重。
+
+    同一张卡在流式更新时标题计数不变 → 同一轮（不重复发确认）；
+    豆包再次回复一张新卡时标题计数 +1 → 新的一轮（必须再确认，否则镜卡死不出片）。
+    """
+    titles = int(state.get("cardTitles", 0) or 0)
+    asks = int(state.get("askCount", 0) or 0)
+    if titles > 0:
+        return ("title", titles)
+    if asks > 0:
+        return ("ask", asks)
+    idx = int(state.get("cardIdx", -1) or -1)
+    if idx >= 0:
+        return ("idx", idx)
+    params = parse_confirm_card(state.get("card", "") or "")
+    return ("fp", f"{params.get('model')}|{params.get('seconds')}|"
+                  f"{params.get('ratio')}|{params.get('style')}")
+
+
 def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = None,
                 expect_style_key: str | None = None,
                 timeout: int = RENDER_TIMEOUT,
@@ -349,7 +374,8 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     回复驱动的渲染等待（状态机）：每轮先读豆包实际回复，再决定下一步——
 
       1. 出现新的 <video>（时长>=3s）      -> (视频信息, None)
-      2. 回复为「视频生成参数确认」卡       -> 解析参数并核对，自动二次确认（每镜 1 次）
+      2. 回复为「视频生成参数确认」卡       -> 解析参数并核对，自动确认
+         （豆包可能二次、三次要求确认，最多确认 3 轮，每轮只发一次）
       3. 额度耗尽文案（不论新旧）           -> (None, "quota")，全局致命，调用方应中断整批
          其他新增错误（审核/失败）          -> (None, None)，本镜失败
       4. 超时                               -> (None, None)
@@ -358,17 +384,12 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     last_report = 0
     confirm_count = 0
     # 参数卡去重（实测教训：朴素"每轮见到卡就确认"曾对同一张卡连发 3 条确认消息）。
-    # 主判据是卡片标题「视频生成参数确认」在 innerText 中的字符位置：
-    #   - 卡片一旦插入，其前面的消息文本已定稿，位置在整个渲染期稳定不变；
-    #   - 新卡（豆包的多步确认）一定追加在更靠后的位置。
-    # 不能用卡片文本内容做指纹——流式输出期间 slice(i, i+700) 窗口里卡片之后的
-    # 内容持续增长，指纹每轮都变，会被误判成"新卡"而重复确认。
-    confirmed_card_idxs: set[int] = set()       # 已确认卡片的标题位置
-    confirmed_param_fps: set[str] = set()       # 定位不到标题时的兜底：参数字段指纹
+    # 判据是「确认轮次」而不是卡片位置：累计出现第 N 张卡/第 N 次催确认就算新的一轮，
+    # 同一张卡流式更新时计数不变，不会重复确认。
+    # 为什么不能用确认锁：豆包在收到第一次确认后，可能重新规划并再回一张参数卡，
+    # 若一锁到底就会永远不确认、镜卡死不出片（2026-10-23 用户截图实锤）。
+    confirmed_rounds: set = set()              # 已确认过的轮次键
     clicked_buttons: set[str] = set()
-    # 锁定：首次确认（文本或按钮）后立即设 True，后续卡片一律视为旧卡，
-    # 杜绝流式更新导致 cardIdx 漂移 → 误判新卡 → 重复发"确认"文本 → 多扣额度。
-    shot_confirmed = False
     # 提交时刻的回复基线：
     #  - 历史错误不算"新增"；
     #  - 上一镜残留的参数卡不许被当成新卡重复确认（连续生成时同一标签同一会话）。
@@ -379,14 +400,12 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     try:
         _pre = read_reply_state(page)
         pre_errors = set(_pre.get("errors", []))
-        _pre_idx = int(_pre.get("cardIdx", -1) or -1)
-        if _pre_idx >= 0:
-            confirmed_card_idxs.add(_pre_idx)
-        else:
-            _pp = parse_confirm_card(_pre.get("card", "") or "")
-            _fp = f"{_pp.get('model')}|{_pp.get('seconds')}|{_pp.get('ratio')}|{_pp.get('style')}"
-            if _pp.get("model") or _pp.get("seconds") is not None:
-                confirmed_param_fps.add(_fp)
+        _pre_titles = int(_pre.get("cardTitles", 0) or 0)
+        _pre_asks = int(_pre.get("askCount", 0) or 0)
+        if _pre_titles > 0:
+            confirmed_rounds.add(("title", _pre_titles))
+        if _pre_asks > 0:
+            confirmed_rounds.add(("ask", _pre_asks))
     except Exception:
         pass
     # 基线视频指纹：豆包会对历史消息里的旧视频做虚拟化卸载（DOM 里时有时无），
@@ -532,6 +551,13 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                             seen_sentences.clear()
                         log(f"  · 豆包: {s}")
 
+            # 豆包读不到参考图时会自行降级成纯文生视频，成片人物与参考图脱钩，
+            # 必须判本镜失败（此时尚未渲染，尽早终止可少浪费等待时间）
+            if any(k in reply_tail for k in (
+                    "参考图资源当前无法读取", "改为纯文生视频", "不再依赖图片引用")):
+                log("  ! 豆包读不到参考图，已改为纯文生视频，本镜作废")
+                return None, "ref_lost"
+
             # 状态3：错误文案 → 立即失败
             for e in state.get("errors", []):
                 if QUOTA_RE.search(e):
@@ -567,25 +593,16 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                     log(f"  · 豆包回复: {read_doubao_reply(page)[:200]}")
                     return None, "paid"
 
-            # 状态2：参数确认卡 → 解析核对 → 二次确认
-            # 去重主键是卡片标题位置（流式期间稳定）；定位不到标题时才退回
-            # 「模型|时长|比例|风格」参数字段指纹（不能用 700 字原始卡片文本，
-            # 其尾部随流式输出不断增长，指纹每轮都变）。
+            # 状态2：参数确认卡 → 解析核对 → 自动确认（豆包可能要求多轮确认）
+            # 去重主键是「确认轮次」：第 N 张标题 / 第 N 次催确认各算一轮；
+            # 定位不到标题与催确认句时，才退回参数字段指纹（不能用 700 字原始卡片
+            # 文本，其尾部随流式输出不断增长，指纹每轮都变）。
             card_text = state.get("card", "") or ""
-            card_idx = int(state.get("cardIdx", -1) or -1)
             params = parse_confirm_card(card_text)
-            param_fp = f"{params.get('model')}|{params.get('seconds')}|" \
-                       f"{params.get('ratio')}|{params.get('style')}"
-            if card_idx >= 0:
-                is_new_card = card_idx not in confirmed_card_idxs
-            else:
-                is_new_card = bool(params.get("model") or params.get("seconds") is not None) \
-                              and param_fp not in confirmed_param_fps
-            if state.get("hasCard") and is_new_card and confirm_count < 3 and not shot_confirmed:
-                if card_idx >= 0:
-                    confirmed_card_idxs.add(card_idx)
-                else:
-                    confirmed_param_fps.add(param_fp)
+            round_key = _confirm_round_key(state)
+            is_new_round = bool(state.get("hasCard")) and round_key not in confirmed_rounds
+            if is_new_round and confirm_count < 3:
+                confirmed_rounds.add(round_key)
                 log("  · 豆包回复「视频生成参数确认」卡：")
                 if params.get("model"):
                     log(f"      模型 {params['model']}")
@@ -606,8 +623,7 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                 action = send_confirmation(page)
                 if action != "none":
                     confirm_count += 1
-                    shot_confirmed = True  # 首次确认后立即锁定，不再处理后续卡片
-                    log(f"  · 已自动确认（{action}），等待渲染开始")
+                    log(f"  · 已自动确认第 {confirm_count} 轮（{action}），等待渲染开始")
                     time.sleep(2)
                     # 卡片确认后再找一次"确认生成"按钮（可能需要二次按钮点击）；
                     # 只做按钮探测，禁止再发文本消息
@@ -617,13 +633,11 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                         log(f"  · 二次确认按钮: {action2}")
                         time.sleep(3)
                 else:
-                    log("  ! 无法完成二次确认（无确认按钮且消息发送失败）")
+                    log("  ! 无法完成本轮确认（无确认按钮且消息发送失败）")
             elif not state.get("hasCard") and confirm_count < 3:
                 # 非卡片状态下也检查"确认生成"按钮（豆包可能有多个确认步骤），
                 # 同一文本的按钮只点一次（clicked_buttons 去重）。
-                # 注意：shot_confirmed 仅锁文本消息（防重复发"确认"文本多扣额度），
-                # 不锁按钮点击——按钮由 clicked_buttons 自身去重，不会重复点相同按钮。
-                # 实测 bug（2026-10-17）：若此处带 not shot_confirmed 条件，文本确认后
+                # 实测 bug（2026-10-17）：若此处也要求“已确认过就跳过”，文本确认后
                 # 主循环永不进此分支，二次确认按钮若未在 action2 检测窗口期内出现
                 # （2s 太短），后续永远不会被点，镜卡死在"确认生成"按钮处。
                 try:
@@ -675,40 +689,50 @@ def get_video_src(page: CDPPage) -> str | None:
         return None
 
 
-def _save_b64_response(res, filepath: str) -> bool:
-    if isinstance(res, dict) and res.get("b64"):
-        with open(filepath, "wb") as f:
-            f.write(base64.b64decode(res["b64"]))
-        return os.path.getsize(filepath) > 1024
-    return False
+def _is_mp4_bytes(data: bytes) -> bool:
+    """校验字节流是否为 mp4：大小 > 10KB 且文件头第 4~8 字节为 ftyp。"""
+    return len(data) > 10 * 1024 and data[4:8] == b"ftyp"
+
+
+def _is_mp4_file(filepath: str) -> bool:
+    """校验已落盘文件是否为 mp4（读取文件头，不存在返回 False）。"""
+    if not os.path.exists(filepath):
+        return False
+    try:
+        with open(filepath, "rb") as f:
+            data = f.read(10 * 1024 + 8)
+    except OSError:
+        return False
+    return _is_mp4_bytes(data)
 
 
 def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str | None:
     """
-    下载视频，策略按优先级：
-      0) 无水印直链：捕获 fallback_api → logo_type=unwatermarked → qAAB 解密
-         （失败自动降级，不影响后续带水印策略）
-      1) https 直链：带 Cookie/Referer 直接下载（CDN 资源通常需要登录态）
-      2) blob: 源：页面内 fetch -> base64 取回（CDN 直链拿不到时的可靠兜底）
-      3) 点击页面下载按钮（浏览器保存到默认下载目录）
+    下载视频，只保留两档策略（按优先级）：
+      1) 无水印原片：捕获 fallback_api → logo_type=unwatermarked → qAAB 解密
+         （失败自动降级到带水印页面资源，不影响后续流程）
+      2) 带水印页面资源：
+         a. https 直链：带 Cookie/Referer 直接下载（CDN 资源通常需要登录态）
+         b. blob: 源：页面内 fetch -> base64 取回（CDN 直链拿不到时的兜底）
+         两种方式都必须通过 mp4 文件头校验才落盘，非 mp4 内容直接丢弃。
     """
     os.makedirs(outdir, exist_ok=True)
     filename = f"shot_{index:02d}_{seconds}s.mp4"
     filepath = os.path.join(outdir, filename)
 
-    # 方案0：无水印直链（fallback_api + unwatermarked + token 解密）
+    # 方案0：无水印原片（media_unlock 内部已校验 mp4）
     try:
         if media_unlock.is_armed(page):
             path = media_unlock.download_unwatermarked_video(page, filepath)
             if path:
-                log("  · 已通过无水印链路下载")
+                log("  · 已下载无水印原片")
                 return path
     except CDPError as e:
-        log(f"  · 无水印链路异常，降级带水印策略: {e}")
+        log(f"  · 无水印原片获取异常，降级下载带水印页面资源: {e}")
 
     src = get_video_src(page)
 
-    # 方案1：https 直链 + Cookie
+    # 方案1：https 直链 + Cookie（落盘前校验 mp4）
     if src and src.startswith(("http://", "https://")) and not src.startswith("blob:"):
         try:
             headers = {
@@ -720,14 +744,20 @@ def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str 
                 headers["Cookie"] = ck
             with _OPENER.open(urllib.request.Request(src, headers=headers), timeout=180) as r:
                 data = r.read()
-            if len(data) > 1024:
+            if not _is_mp4_bytes(data):
+                log("  · https 直链返回的不是 mp4（可能是 HTML/鉴权页），降级 blob 取回")
+            else:
                 with open(filepath, "wb") as f:
                     f.write(data)
-                return filepath
+                if _is_mp4_file(filepath):
+                    log("  · 已下载带水印页面资源（https 直链）")
+                    return filepath
+                os.remove(filepath)
+                log("  · https 直链落盘文件校验失败，降级 blob 取回")
         except Exception:
             pass
 
-    # 方案2：blob 源 → 页面内 fetch 取回 base64
+    # 方案2：blob 源 → 页面内 fetch 取回 base64（解码后校验 mp4 才落盘）
     try:
         res = page.eval_js("""
         (async ()=>{
@@ -747,31 +777,19 @@ def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str 
           return {b64: btoa(binary), size: b.size};
         })()
         """, await_promise=True, recv_timeout=300)
-        if _save_b64_response(res, filepath):
-            return filepath
-    except CDPError:
-        pass
-
-    # 方案3：点击下载按钮
-    js_dl = """
-    (()=>{
-      const kws=['下载','保存','导出'];
-      const btns=[...document.querySelectorAll('button,[role=button],a')]
-        .filter(b=>{
-          if(b.offsetParent===null) return false;
-          const t=(b.innerText||b.getAttribute('aria-label')||b.getAttribute('title')||'').trim();
-          return t && kws.some(k=>t.includes(k));
-        });
-      if(btns.length){btns[0].click();return 'clicked';}
-      return null;
-    })()
-    """
-    try:
-        if page.eval_js(js_dl):
-            log("  · 已触发下载按钮，浏览器将保存到默认下载目录")
-            log(f"  · 请手动把该文件改名/移动到: {filepath}")
-            return "DOWNLOAD_TRIGGERED"
-    except CDPError:
+        if isinstance(res, dict) and res.get("b64"):
+            data = base64.b64decode(res["b64"])
+            if not _is_mp4_bytes(data):
+                log("  · blob 取回内容不是 mp4，放弃该资源")
+            else:
+                with open(filepath, "wb") as f:
+                    f.write(data)
+                if _is_mp4_file(filepath):
+                    log("  · 已下载带水印页面资源（blob fetch）")
+                    return filepath
+                os.remove(filepath)
+                log("  · blob 落盘文件校验失败，放弃该资源")
+    except (CDPError, ValueError):
         pass
 
     return None
@@ -994,13 +1012,14 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     ref_paths = [item[0] for item in ref_items]
 
     # ── 上传参考图（图生视频模式） ──
+    # 必须先确认每张图都上传成功再提交：豆包读不到参考图时会自动改成纯文生视频，
+    # 人物形象与参考图脱钩且照样扣 1 次额度（2026-10-23 实测）。
     if ref_paths:
         log(f"  · 上传参考图: {len(ref_paths)} 张（{', '.join(os.path.basename(p) for p in ref_paths)}）")
-        try:
-            page.set_file_input(ref_paths)
-            time.sleep(3)  # 等待图片预览加载
-        except CDPError as e:
-            log(f"  ! 上传参考图失败: {e}，改用纯文本模式")
+        if not upload_images(page, ref_paths, log_prefix="参考图"):
+            diag_snapshot(page, outdir, f"shot_{idx:02d}_upload_fail")
+            log("  ! 参考图未全部上传成功，已中止本镜（不生成无参考的纯文视频）")
+            return "failed", None
 
     # ── prompt 开头标注每张参考图用途（@图片N 语法）──
     if ref_items:
@@ -1032,6 +1051,11 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     if error_tag == "paid":
         return "paid", None
 
+    if error_tag == "ref_lost":
+        diag_snapshot(page, outdir, f"shot_{idx:02d}_ref_lost")
+        log("  ! 参考图丢失（豆包改为纯文生成），请检查上传链路后重跑本镜")
+        return "failed", None
+
     if not video:
         log(f"  ! 本镜未出片（报错或超时 {RENDER_TIMEOUT}s）")
         diag_snapshot(page, outdir, f"shot_{idx:02d}_render_timeout")
@@ -1042,8 +1066,6 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     if video.get("src"):
         _KNOWN_VIDEO_SRCS.add(video["src"])
     path = download_video(page, outdir, idx, secs)
-    if path == "DOWNLOAD_TRIGGERED":
-        return "ok", path
     if path:
         size = os.path.getsize(path) / 1024 / 1024
         log(f"  · 已下载: {path} ({size:.1f} MB)")
@@ -1097,7 +1119,7 @@ def main():
     ap.add_argument("--allow-paid", action="store_true",
                     help="豆包询问付费额度（免费额度已用完）时，自动点「确认生成」按钮继续（默认 False：跳过本镜记录待补）")
     ap.add_argument("--unlock", action="store_true",
-                    help="启用无水印媒体链路（默认关闭，使用带水印下载以降低合规风险）")
+                    help="启用视频无水印下载（默认关闭；图片始终优先下载无水印原图，不受此开关影响）")
     ap.add_argument("--char-refs", default=None,
                     help="角色参考图索引 JSON（char_refs_index.json），用于图生视频时上传参考图")
     ap.add_argument("--props-refs", default=None,

@@ -34,6 +34,34 @@ def log(msg: str):
 
 
 # ──────────────────────────────────────────────────────────────
+# 网络响应 URL 匹配（用于从并发请求里挑出目标资源的响应）
+# ──────────────────────────────────────────────────────────────
+
+def _url_base(url: str) -> str:
+    """去掉 query 与 `~` 缩略图后缀后的 URL 基名。"""
+    if not url:
+        return ""
+    base = url.split("?", 1)[0]
+    if "~" in base:
+        base = base.split("~", 1)[0]
+    return base
+
+
+def _url_matches(target: str, candidate: str) -> bool:
+    """
+    判断响应 URL 是否就是目标 URL 指向的资源。
+
+    规则：双方去掉 query 与 `~` 缩略图后缀后，任一 base 是另一 base 的子串即视为匹配
+    （CDN 会在原图 URL 后追加 `~tplv-xxx` 等处理参数，故不能要求完全相等）。
+    """
+    a = _url_base(target)
+    b = _url_base(candidate)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+# ──────────────────────────────────────────────────────────────
 # 极简 WebSocket 客户端（RFC6455 子集）
 # ──────────────────────────────────────────────────────────────
 
@@ -408,15 +436,6 @@ class CDPPage:
         with open(filepath, "wb") as f:
             f.write(base64.b64decode(res["data"]))
 
-    def screenshot_clip(self, filepath: str, x: float, y: float, w: float, h: float, scale: float = 1):
-        """截取页面指定区域，保存为 PNG。scale>1 可获得更高分辨率。"""
-        res = self.call("Page.captureScreenshot", recv_timeout=60,
-                        format="png", clip={
-                            "x": x, "y": y, "width": w, "height": h, "scale": scale
-                        })
-        with open(filepath, "wb") as f:
-            f.write(base64.b64decode(res["data"]))
-
     def cookies(self) -> list:
         """获取浏览器所有 Cookie。"""
         return self.call("Network.getAllCookies", recv_timeout=30).get("cookies", [])
@@ -453,7 +472,16 @@ class CDPPage:
         # DOM.setFileInputFiles 已原生触发 change（及 input）事件，
         # 不再手动 dispatch 任何事件——否则豆包组件会处理两遍，
         # 导致每张图上传两次/多扣额度（2026-10-17 用户实测确认）。
-        return True
+
+        # 复核注入是否真正生效：React 水合未完成时 setFileInputFiles 会静默失败
+        # （files 仍为 0），若不校验，上层会误以为已上传而提交纯文请求。
+        try:
+            cnt = self.eval_js(
+                "(()=>{const i=document.querySelector('%s');return i?i.files.length:-1;})()"
+                % css_selector.replace("'", "\\'"))
+        except CDPError:
+            cnt = -1
+        return cnt == len(abs_paths)
 
     def download_raw(self, url: str, filepath: str, timeout: float = 30) -> bool:
         """
@@ -463,7 +491,7 @@ class CDPPage:
         流程：
           1. 启用 Network 域，清空事件队列
           2. 用 JS 在页面内新建 img 加载图片（浏览器带 cookie 发请求）
-          3. 等待 Network.loadingFinished 事件，拿到 requestId
+          3. 等待 Network.loadingFinished 事件，只采用 URL 与目标匹配的 requestId
           4. 用 Network.getResponseBody 获取原始 base64 数据
           5. 解码保存到文件
         """
@@ -488,37 +516,44 @@ class CDPPage:
         }})()
         """)
 
-        # 等待网络事件（loadingFinished 或 responseReceived）
+        # 等待网络事件：只接受与目标 URL 匹配的请求
         request_id = None
+        req_urls = {}          # requestId -> 请求 URL
+        matched = set()        # 命中目标 URL 的 requestId
         deadline = _time.time() + timeout
-        url_base = url.split("?")[0].split("~")[0]  # 基础 URL（去掉参数和缩略图后缀）
         while _time.time() < deadline:
             _time.sleep(1)
             # 从 WebSocket 读取待处理事件
             self.drain_events(timeout=1.0)
-            # 收集 loadingFinished 事件
-            for evt in self.pop_events("Network.loadingFinished"):
-                rid = evt.get("params", {}).get("requestId", "")
+            # 一次性取出所有相关事件，避免逐个 pop 时丢事件/顺序颠倒
+            sent = self.pop_events("Network.requestWillBeSent")
+            responses = self.pop_events("Network.responseReceived")
+            finished = self.pop_events("Network.loadingFinished")
+            # 建立 requestId -> URL 映射
+            for evt in sent:
+                p = evt.get("params", {})
+                rid = p.get("requestId", "")
                 if rid:
-                    # 如果有多个，优先取最后匹配的
+                    req_urls[rid] = (p.get("request") or {}).get("url", "")
+            # responseReceived 中 URL 匹配的 requestId 加入匹配集合
+            for evt in responses:
+                p = evt.get("params", {})
+                rid = p.get("requestId", "")
+                rurl = (p.get("response") or {}).get("url", "")
+                if not rid:
+                    continue
+                if rurl and not req_urls.get(rid):
+                    req_urls[rid] = rurl
+                if _url_matches(url, rurl):
+                    matched.add(rid)
+            # 只有属于匹配集合（或 URL 已知且匹配）的 loadingFinished 才采用
+            for evt in finished:
+                rid = evt.get("params", {}).get("requestId", "")
+                if not rid:
+                    continue
+                if rid in matched or _url_matches(url, req_urls.get(rid, "")):
+                    matched.add(rid)
                     request_id = rid
-            if request_id:
-                break
-            # 也检查 responseReceived（有 URL 可匹配）
-            for evt in self.pop_events("Network.responseReceived"):
-                resp = evt.get("params", {}).get("response", {})
-                resp_url = resp.get("url", "")
-                if "rc_gen_image" in resp_url or url_base in resp_url:
-                    request_id = evt.get("params", {}).get("requestId", "")
-                    break
-            if request_id:
-                break
-            # 也检查 dataReceived 事件
-            for evt in self.pop_events("Network.dataReceived"):
-                rurl = evt.get("params", {}).get("url", "")
-                if "rc_gen_image" in rurl or url_base in rurl:
-                    request_id = evt.get("params", {}).get("requestId", "")
-                    break
             if request_id:
                 break
 
@@ -526,6 +561,7 @@ class CDPPage:
         self.eval_js("(()=>{const el=document.getElementById('__dl_raw');if(el)el.remove();})()")
 
         if not request_id:
+            log("  · download_raw: 未捕获到目标 URL 的网络响应")
             return False
 
         # 用 requestId 拿响应体
@@ -583,35 +619,51 @@ class CDPPage:
             log(f"  · download_native: fetch 触发失败: {e}")
             return False
 
-        # 等待 Network 事件，获取 requestId
+        # 等待 Network 事件，只接受与目标 URL 匹配的请求
         request_id = None
+        req_urls = {}          # requestId -> 请求 URL
+        matched = set()        # 命中目标 URL 的 requestId
         deadline = _time.time() + timeout
-        url_base = url.split("?")[0].split("~")[0]
 
         while _time.time() < deadline:
             _time.sleep(1)
             self.drain_events(timeout=1.0)
 
-            # 优先找 loadingFinished（图片完全下载）
-            for evt in self.pop_events("Network.loadingFinished"):
-                rid = evt.get("params", {}).get("requestId", "")
+            # 一次性取出所有相关事件，避免逐个 pop 时丢事件/顺序颠倒
+            sent = self.pop_events("Network.requestWillBeSent")
+            responses = self.pop_events("Network.responseReceived")
+            finished = self.pop_events("Network.loadingFinished")
+
+            # 建立 requestId -> URL 映射
+            for evt in sent:
+                p = evt.get("params", {})
+                rid = p.get("requestId", "")
                 if rid:
+                    req_urls[rid] = (p.get("request") or {}).get("url", "")
+            # responseReceived 中 URL 匹配的 requestId 加入匹配集合
+            for evt in responses:
+                p = evt.get("params", {})
+                rid = p.get("requestId", "")
+                rurl = (p.get("response") or {}).get("url", "")
+                if not rid:
+                    continue
+                if rurl and not req_urls.get(rid):
+                    req_urls[rid] = rurl
+                if _url_matches(url, rurl):
+                    matched.add(rid)
+            # 只有属于匹配集合（或 URL 已知且匹配）的 loadingFinished 才采用
+            for evt in finished:
+                rid = evt.get("params", {}).get("requestId", "")
+                if not rid:
+                    continue
+                if rid in matched or _url_matches(url, req_urls.get(rid, "")):
+                    matched.add(rid)
                     request_id = rid
-                    break
-            if request_id:
-                break
-            # 次找 responseReceived（有 URL 可匹配）
-            for evt in self.pop_events("Network.responseReceived"):
-                resp = evt.get("params", {}).get("response", {})
-                resp_url = resp.get("url", "")
-                if "rc_gen_image" in resp_url or url_base in resp_url:
-                    request_id = evt.get("params", {}).get("requestId", "")
-                    break
             if request_id:
                 break
 
         if not request_id:
-            log("  · download_native: 未捕获到网络事件")
+            log("  · download_native: 未捕获到目标 URL 的网络响应")
             return False
 
         # 用 requestId 拿响应体

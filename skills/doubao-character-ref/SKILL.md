@@ -131,7 +131,7 @@ python skills/doubao-character-ref/scripts/char_ref_gen.py characters.json -o ./
 python skills/doubao-character-ref/scripts/char_ref_gen.py characters.json -o ./char_refs --only 1,2
 ```
 
-脚本会：打开豆包 → 逐角色发送六视图提示词 → 等出图 → 下载 → 逐道具发送道具特写提示词 → 下载 → 关闭标签页。
+脚本会：打开豆包 → 逐角色发送六视图提示词 → 等出图 → 下载 → 逐道具发送道具特写提示词 → 下载 → 关闭标签页。图片始终优先下载无水印原图，失败才降级带水印；文件由脚本直接写盘，不点击页面上的下载/保存/导出按钮，也不安装豆包桌面版。
 
 每个角色产出一张 `{角色名}_六视图.png`，每个道具产出一张 `{道具名}_道具.png`，外加一份 `char_refs_index.json` 索引。
 

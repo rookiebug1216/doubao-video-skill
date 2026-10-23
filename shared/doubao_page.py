@@ -192,6 +192,85 @@ def submit_prompt(page: CDPPage) -> bool:
         return False
 
 
+# ──────────────────────────────────────────────────────────────
+# 参考图上传与「上传完成」校验
+# ──────────────────────────────────────────────────────────────
+
+# 上传完成的 DOM 信号（2026-10-23 Chrome 实测）：
+# 豆包把已上传图片渲染成输入区内的 blob: 缩略图（class 含 image-，naturalWidth 为原图宽度）；
+# 未上传完成的文件不会出现在输入区，页面上传中会出现「上传中」提示。
+UPLOAD_STATE_JS = """
+(()=>{
+  const box=document.querySelector('[data-testid="chat_input"]')||document.body;
+  const chips=[...box.querySelectorAll('img')].filter(i=>{
+    const s=i.currentSrc||i.src||'';
+    return s.startsWith('blob:') && i.complete && i.naturalWidth>200;
+  }).length;
+  const t=document.body.innerText||'';
+  return JSON.stringify({
+    ready: chips,
+    uploading: /上传中|正在上传/.test(t),
+    failed: /上传失败|文件上传失败|无法上传/.test(t)
+  });
+})()
+"""
+
+
+def read_upload_state(page: CDPPage) -> dict:
+    try:
+        raw = page.eval_js(UPLOAD_STATE_JS)
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (CDPError, json.JSONDecodeError):
+        return {"ready": 0, "uploading": False, "failed": False}
+
+
+def upload_images(page: CDPPage, filepaths: list, timeout: int = 90,
+                  retries: int = 2, log_prefix: str = "参考图") -> bool:
+    """上传本地图片到豆包对话框，并确认每张图都已变成可提交的缩略图。
+
+    返回 True 表示全部上传成功；False 表示重试后仍未成功——调用方不得提交，
+    否则豆包会以纯文方式生成（参考图丢失，人物不一致、白白消耗额度）。
+
+    判定信号：输入区内 blob: 缩略图数量 >= 文件数，且页面无「上传中」。
+    重试只在「一张都没就绪」时重新注入：已有部分附件时再注入会产生重复附件，
+    导致 prompt 里的 @图片N 编号错位，故直接返回失败交给上层人工处理。
+    """
+    paths = [p for p in (filepaths or []) if p and os.path.exists(p)]
+    expected = len(paths)
+    if expected == 0:
+        return True
+
+    # 输入区可能残留上一轮的缩略图，取基线做增量判定，避免误判为“已上传”
+    base_ready = read_upload_state(page).get("ready", 0)
+
+    for attempt in range(1, retries + 2):
+        if not page.set_file_input(paths):
+            log(f"  ! {log_prefix}注入未生效（第 {attempt} 次，文件未被浏览器接收）")
+            time.sleep(2)
+            continue
+
+        deadline = time.time() + timeout
+        state = read_upload_state(page)
+        while time.time() < deadline:
+            state = read_upload_state(page)
+            ready = state.get("ready", 0) - base_ready
+            if state.get("failed"):
+                log(f"  ! 豆包提示{log_prefix}上传失败")
+                return False
+            if ready >= expected and not state.get("uploading"):
+                log(f"  · {log_prefix}上传完成（{ready}/{expected} 张）")
+                return True
+            time.sleep(1.5)
+
+        ready = state.get("ready", 0) - base_ready
+        log(f"  ! {log_prefix}上传超时（{ready}/{expected} 张，{timeout}s）")
+        if ready > 0:
+            # 部分已就绪：再注入会重复附件并打乱 @图片N，直接失败
+            return False
+        time.sleep(2)
+    return False
+
+
 def new_conversation(page: CDPPage, timeout: int = 60) -> bool:
     """新建豆包对话，清空上一镜残留状态。
 

@@ -6,7 +6,7 @@
   cdp_browser   CDP WebSocket 客户端 + 浏览器发现/拉起/标签页管理
   doubao_page   豆包页面操作原语（就绪/登录/填入/提交/截图/诊断）
   style_presets 画风预设（所有 skill 统一，防止风格漂移）
-  imagegen      图生图引擎（渲染检测/五级无水印下载/参考图上传/单张生成 generate_one）
+  imagegen      图生图引擎（渲染检测/双档图片下载（无水印原图优先，带水印兜底，不截图）/参考图上传/单张生成 generate_one）
   media_unlock  视频无水印下载（fallback_api 解密链路）
   video_utils   视频文件工具
 

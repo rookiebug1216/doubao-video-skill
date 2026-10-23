@@ -5,7 +5,7 @@
 从 doubao-character-ref/scripts/char_ref_gen.py 下沉而来（风格无关部分）：
   * 回复状态检测与额度识别（read_reply_state / quota_exhausted）
   * 图片渲染状态机等待（wait_image）
-  * 四级图片下载链路（_ROUTER_DATA 直链 → fetch+CDP → Image+CDP → 截图兜底）
+  * 双档图片下载：无水印原图优先，带水印页面资源兜底；不做截图、不点击页面按钮
   * 参考图上传 + 图生图单张生成入口（generate_one）
 
 风格相关部分（六视图/道具/关键帧提示词构建）留在各 skill，
@@ -29,7 +29,7 @@ import time
 import urllib.request
 
 from .cdp_browser import CDPPage, CDPError, DOUBAO_HOME, _OPENER, log, cookie_header
-from .doubao_page import fill_prompt, submit_prompt, diag_snapshot
+from .doubao_page import fill_prompt, submit_prompt, diag_snapshot, upload_images
 
 # 图片生成通常 30-90 秒，取 5 分钟留余量
 RENDER_TIMEOUT = 300
@@ -289,125 +289,41 @@ def _ratio_mismatch(filepath: str, expect_portrait: bool | None) -> bool:
     return is_portrait != expect_portrait
 
 
-def download_image(page: CDPPage, outdir: str, name: str, tag: str,
-                   img_info: dict | None = None, expect_portrait: bool | None = None,
-                   unlock: bool = False) -> str | None:
-    """下载图片包装：成功后校验图片方向与预期是否一致（防止抓错参考图）。
-
-    尾帧/首帧图为竖版 9:16（expect_portrait=True），六视图/道具图方向不定
-    （expect_portrait=None，不校验）。方向不符时删除文件并返回 None，
-    让上层判定本镜关键帧生成失败，避免基于错误参考图继续生成视频。
-
-    unlock: 是否启用无水印链路（默认 False，带水印下载）。
-    """
-    result = _download_image_impl(page, outdir, name, tag, img_info, unlock=unlock)
-    if result and result not in ("DOWNLOAD_TRIGGERED",) and os.path.isfile(result):
-        if _ratio_mismatch(result, expect_portrait):
-            orient = "竖版" if expect_portrait else "横版"
-            log(f"  ✗ 下载图方向与预期({orient})不符，疑似抓错参考图，已删除: {os.path.basename(result)}")
-            try:
-                os.remove(result)
-            except OSError:
-                pass
-            return None
-    return result
-
-
-def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
-                   img_info: dict | None = None, unlock: bool = False) -> str | None:
-    """
-    下载图片，四级策略：
-      0) _ROUTER_DATA 直取：读页面首屏数据中服务端签好的 image_raw 无水印 URL，直链下载（首选）
-      1) fetch 拦截：在豆包页面用 fetch(no-cors) 触发请求，CDP getResponseBody 取原始字节
-      2) new Image+CDP：新建 img 触发加载，CDP getResponseBody 取原始字节（备选）
-      3) 注入缓存图截图：页面内新建 img 设原始尺寸后截图（兜底）
-
-    img_info: wait_image() 返回的 {"src": ...}，优先使用该 src 而非重新搜索。
-    unlock: 是否启用无水印链路（默认 False，带水印下载；需 --unlock 启用）
-    """
-    os.makedirs(outdir, exist_ok=True)
-    filename = f"{name}_{tag}.png"
-    filepath = os.path.join(outdir, filename)
-
-    if unlock:
-        # 方案0（首选）：_ROUTER_DATA 首屏数据直取 image_raw 无水印原图
-        try:
-            raw_urls = _router_raw_image_urls(page)
-            if raw_urls:
-                log(f"  · _ROUTER_DATA 命中 {len(raw_urls)} 条 image_raw URL，逐条直链下载…")
-                for raw_url in raw_urls:
-                    if _direct_download_image(page, raw_url, filepath):
-                        log(f"  · 无水印原图下载成功（_ROUTER_DATA 直链），{os.path.getsize(filepath) // 1024} KB")
-                        return filepath
-                    log("  · 该条非有效图片（视频/过期），尝试下一条…")
-                log("  · _ROUTER_DATA 条目均无效，尝试其他方案…")
-            else:
-                log("  · _ROUTER_DATA 未命中（图未入首屏数据/页面无生成图），尝试其他方案…")
-        except CDPError as e:
-            log(f"  · _ROUTER_DATA 方案异常: {e}")
-    else:
-        log("  · 无水印链路已禁用，将使用带水印下载")
-
-    # 优先使用 wait_image() 已找到的 src
-    src = img_info.get("src") if img_info else None
-
-    # 方案1：从 fetch 拦截获取无水印原图 URL（带水印时也可用，但 URL 可能是 cgen_lwm3）
+def _is_image_file(filepath: str) -> bool:
+    """校验落盘文件确为图片：PNG/JPEG 文件头 + 体积阈值（>100KB）。"""
     try:
-        ori_images = page.eval_js("JSON.stringify(window.__doubao_ori_images||[])")
-        ori_list = json.loads(ori_images) if ori_images else []
-        if ori_list:
-            ori_url = ori_list[-1]  # 取最新的一张
-            log(f"  · 拦截到无水印原图 URL: {ori_url[:80]}…")
-            # 尝试直接下载
-            if ori_url.startswith(("http://", "https://")):
-                try:
-                    headers = {
-                        "User-Agent": page.eval_js("navigator.userAgent") or "Mozilla/5.0",
-                        "Referer": DOUBAO_HOME + "/",
-                    }
-                    ck = cookie_header(page.cookies(), ori_url)
-                    if ck:
-                        headers["Cookie"] = ck
-                    with _OPENER.open(urllib.request.Request(ori_url, headers=headers), timeout=180) as r:
-                        data = r.read()
-                    if len(data) > 1024:
-                        with open(filepath, "wb") as f:
-                            f.write(data)
-                        log(f"  · 无水印原图下载成功，{len(data)//1024} KB")
-                        return filepath
-                    log(f"  · 无水印 URL 下载太小({len(data)}B)")
-                except Exception as e:
-                    log(f"  · 无水印 URL 下载失败: {e}")
-            # blob: URL 走页面内 fetch
-            if ori_url.startswith("blob:"):
-                src = ori_url  # 让方案2处理
-    except (CDPError, json.JSONDecodeError):
+        if not os.path.isfile(filepath) or os.path.getsize(filepath) <= 100 * 1024:
+            return False
+        with open(filepath, "rb") as f:
+            head = f.read(8)
+        return head == b"\x89PNG\r\n\x1a\n" or head[:3] == b"\xff\xd8\xff"
+    except OSError:
+        return False
+
+
+def _discard_file(filepath: str):
+    """校验不通过时删除残留文件，避免污染输出目录。"""
+    try:
+        os.remove(filepath)
+    except OSError:
         pass
 
-    # 方案0b：高清下载——先尝试 fetch 拦截提取原图 URL，再 CDP 下载，最后截图兜底
-    try:
-        # 方案A：从 fetch 拦截器捕获的 image URL 下载
-        ori_images = page.get_captured_images()
-        if ori_images:
-            for img_info in ori_images:
-                ori_url = img_info.get("url", "")
-                if ori_url and ("rc_gen_image" in ori_url or "byteimg" in ori_url or "imagex" in ori_url):
-                    log(f"  · 从 API 响应提取到原图 URL（{img_info.get('type','')}）")
-                    # 用页面内 fetch 下载（origin 相同，绕过 CORS）
-                    if page.download_via_fetch(ori_url, filepath, timeout=30):
-                        size = os.path.getsize(filepath)
-                        if size > 100 * 1024:
-                            log(f"  · 原图下载成功（fetch+blob），{size//1024} KB")
-                            page.clear_captured_images()
-                            return filepath
-                        log(f"  · fetch 下载文件太小({size//1024}KB)")
-                    else:
-                        log(f"  · fetch 下载失败，尝试 CDP 方案…")
-                    break
 
-        # 方案B：用 CDP Network.getResponseBody 直接拿原始文件字节
-        # 始终搜索页面上的 rc_gen_image 图片（不依赖 wait_image 返回的 src）
-        target_src = ""
+def _candidate_url(item) -> str:
+    """兼容字符串 / {url:...} 两种候选条目，取出 URL。"""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("url", "src", "image_url"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _largest_gen_image_src(page: CDPPage) -> str:
+    """页面中面积最大的 rc_gen_image 图片 src（带水印页面资源）。"""
+    try:
         found = page.eval_js(r"""
         (()=>{
           const imgs=[...document.querySelectorAll('img')]
@@ -422,161 +338,125 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
           return (imgs[0].currentSrc||imgs[0].src||'').slice(0,500);
         })()
         """)
-        if found:
-            target_src = found
+        return found or ""
+    except CDPError:
+        return ""
 
-        if target_src and "rc_gen_image" in target_src:
-            # 等待高清图加载（刚生成的图可能先出现缩略图）
-            time.sleep(3)
-            # 重新搜索最大的 rc_gen_image（可能已加载高清版）
-            big_found = page.eval_js(r"""
-            (()=>{
-              const imgs=[...document.querySelectorAll('img')]
-                .filter(img=>{
-                  if(img.offsetParent===null) return false;
-                  const s=(img.currentSrc||img.src||'');
-                  if(!s || !s.includes('rc_gen_image')) return false;
-                  return img.naturalWidth>500;
-                });
-              if(!imgs.length) return null;
-              imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
-              return (imgs[0].currentSrc||imgs[0].src||'').slice(0,500);
-            })()
-            """)
-            if big_found:
-                target_src = big_found
-                log(f"  · 找到高清图 URL")
 
-            # 方案1：download_native（fetch no-cors + CDP getResponseBody）——最可靠
-            log(f"  · 用 fetch+CDP 下载原图…")
-            if page.download_native(target_src, filepath, timeout=60):
-                size = os.path.getsize(filepath)
-                if size > 100 * 1024:
-                    log(f"  · 原图下载成功，{size//1024} KB")
-                    return filepath
-                log(f"  · 下载文件太小({size//1024}KB)，尝试 CDP 备选方案…")
-            else:
-                log(f"  · download_native 失败，尝试 CDP 备选方案…")
+def _forget_captured(page: CDPPage):
+    """下载成功后清空拦截缓存，避免后续任务串用旧图 URL。"""
+    try:
+        page.clear_captured_images()
+    except CDPError:
+        pass
 
-            # 方案2：download_raw（new Image + CDP getResponseBody）——备选
-            log(f"  · 用 new Image+CDP 下载原图…")
-            if page.download_raw(target_src, filepath, timeout=60):
-                size = os.path.getsize(filepath)
-                if size > 100 * 1024:
-                    log(f"  · 原图下载成功（CDP备选），{size//1024} KB")
-                    return filepath
-                log(f"  · CDP 备选下载文件太小({size//1024}KB)，尝试截图方案…")
-            else:
-                log(f"  · CDP 备选下载失败，尝试截图方案…")
 
-        # 方案0b：在页面内新建 img（缓存图），设为原始尺寸后截图
-        if target_src and "rc_gen_image" in target_src:
-            dims = page.eval_js(f"""
-            (()=>{{
-              const src={json.dumps(target_src)};
-              const img=[...document.querySelectorAll('img')]
-                .find(i=>(i.currentSrc||i.src||'').includes(src.slice(0,80)));
-              if(img) return JSON.stringify({{nw:img.naturalWidth, nh:img.naturalHeight}});
-              return null;
-            }})()
-            """)
-            target_nw, target_nh = 0, 0
-            if dims:
-                d = json.loads(dims)
-                target_nw = d["nw"]
-                target_nh = d["nh"]
-            if target_nw > 500:
-                log(f"  · 注入缓存图（{target_nw}x{target_nh}px）截图…")
-                page.eval_js(f"""
-                (()=>{{
-                  const src={json.dumps(target_src)};
-                  const nw={target_nw}, nh={target_nh};
-                  const ov=document.createElement('div');
-                  ov.id='__dl_overlay';
-                  ov.style.cssText='position:fixed;top:0;left:0;z-index:999999;background:#000;padding:0;margin:0;';
-                  const img=document.createElement('img');
-                  img.src=src;
-                  img.style.cssText='display:block;width:'+nw+'px;height:'+nh+'px;max-width:none;max-height:none;';
-                  ov.appendChild(img);
-                  document.body.appendChild(ov);
-                  return 'injected';
-                }})()
-                """)
-                time.sleep(2)
-                rect = page.eval_js(r"""
-                (()=>{
-                  const ov=document.getElementById('__dl_overlay');
-                  if(!ov) return null;
-                  const r=ov.getBoundingClientRect();
-                  return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height});
-                })()
-                """)
-                if rect:
-                    r = json.loads(rect)
-                    if r.get("w", 0) > 500:
-                        page.screenshot_clip(filepath, r["x"], r["y"], r["w"], r["h"])
-                        if os.path.getsize(filepath) > 1024:
-                            log(f"  · 截图成功，{target_nw}x{target_nh}px，{os.path.getsize(filepath)//1024} KB")
-                            page.eval_js("(()=>{const o=document.getElementById('__dl_overlay');if(o)o.remove();})()")
-                            return filepath
-                page.eval_js("(()=>{const o=document.getElementById('__dl_overlay');if(o)o.remove();})()")
-    except (CDPError, json.JSONDecodeError) as e:
-        log(f"  · 高清下载失败: {e}")
+def download_image(page: CDPPage, outdir: str, name: str, tag: str,
+                   img_info: dict | None = None, expect_portrait: bool | None = None) -> str | None:
+    """下载图片包装：成功后校验图片方向与预期是否一致（防止抓错参考图）。
 
-    # 兜底：重新搜索页面图片（取尺寸最大的，而非最后一个）
-    if not src:
+    尾帧/首帧图为竖版 9:16（expect_portrait=True），六视图/道具图方向不定
+    （expect_portrait=None，不校验）。方向不符时删除文件并返回 None，
+    让上层判定本镜关键帧生成失败，避免基于错误参考图继续生成视频。
+    """
+    result = _download_image_impl(page, outdir, name, tag, img_info)
+    if result and os.path.isfile(result) and _ratio_mismatch(result, expect_portrait):
+        orient = "竖版" if expect_portrait else "横版"
+        log(f"  ✗ 下载图方向与预期({orient})不符，疑似抓错参考图，已删除: {os.path.basename(result)}")
         try:
-            src = page.eval_js("""
-            (()=>{
-              const imgs=[...document.querySelectorAll('img')]
-                .filter(i=>i.offsetParent!==null && (i.src||'').length>20
-                       && !i.src.includes('data:')
-                       && !i.src.includes('icon') && !i.src.includes('logo'));
-              if(!imgs.length) return null;
-              // 按面积排序取最大的（生成图通常比 UI 图标大）
-              imgs.sort((a,b)=>{
-                const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect();
-                return (rb.width*rb.height)-(ra.width*ra.height);
-              });
-              return imgs[0].currentSrc||imgs[0].src||'';
-            })()
-            """)
+            os.remove(result)
+        except OSError:
+            pass
+        return None
+    return result
+
+
+def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
+                         img_info: dict | None = None) -> str | None:
+    """
+    下载图片（双档，不做截图、不点击页面按钮）：
+      1) 无水印原图（始终优先）：_ROUTER_DATA 的 image_raw URL + fetch 钩子捕获的
+         原图 URL，先用 Python 直链，失败再走页面 fetch，保证人物原始分辨率
+      2) 带水印（兜底）：页面尺寸最大的 rc_gen_image，依次尝试 Python 直链 /
+         页面 fetch / download_native / download_raw
+
+    每个方案落盘后用 _is_image_file 校验，不通过即删除并继续下一方案。
+    img_info: wait_image() 返回的 {"src": ...}，优先使用该 src 而非重新搜索。
+    """
+    os.makedirs(outdir, exist_ok=True)
+    filepath = os.path.join(outdir, f"{name}_{tag}.png")
+
+    # ── 第一档：无水印原图（始终优先）──
+    try:
+        router_urls = _router_raw_image_urls(page)
+    except CDPError as e:
+        log(f"  · _ROUTER_DATA 读取异常: {e}")
+        router_urls = []
+
+    captured = []
+    try:
+        ori = page.eval_js("JSON.stringify(window.__doubao_ori_images||[])")
+        if isinstance(ori, str) and ori:
+            captured.extend(json.loads(ori))
+    except (CDPError, json.JSONDecodeError):
+        pass
+    try:
+        captured.extend(page.get_captured_images() or [])
+    except CDPError:
+        pass
+    captured.reverse()  # 最新的原图优先
+
+    seen = set()
+    candidates = []
+    for item in list(router_urls) + captured:
+        url = _candidate_url(item)
+        if url and url not in seen:
+            seen.add(url)
+            candidates.append(url)
+
+    for url in candidates:
+        if _direct_download_image(page, url, filepath) and _is_image_file(filepath):
+            log(f"  · 无水印原图下载成功（直链），{os.path.getsize(filepath) // 1024} KB")
+            _forget_captured(page)
+            return filepath
+        _discard_file(filepath)
+        try:
+            fetched = page.download_via_fetch(url, filepath, timeout=30)
         except CDPError:
-            src = None
+            fetched = False
+        if fetched and _is_image_file(filepath):
+            log(f"  · 无水印原图下载成功（页面 fetch），{os.path.getsize(filepath) // 1024} KB")
+            _forget_captured(page)
+            return filepath
+        _discard_file(filepath)
 
-    # 方案1：https 直链 + Cookie
-    if src and src.startswith(("http://", "https://")) and not src.startswith("blob:"):
-        log(f"  · 尝试方案1（https 直链下载）…")
-        try:
-            headers = {
-                "User-Agent": page.eval_js("navigator.userAgent") or "Mozilla/5.0",
-                "Referer": DOUBAO_HOME + "/",
-            }
-            ck = cookie_header(page.cookies(), src)
-            if ck:
-                headers["Cookie"] = ck
-            with _OPENER.open(urllib.request.Request(src, headers=headers), timeout=180) as r:
-                data = r.read()
-            log(f"  · 方案1 下载到 {len(data)} 字节")
-            if len(data) > 1024:
-                with open(filepath, "wb") as f:
-                    f.write(data)
-                return filepath
-            else:
-                log(f"  · 方案1 数据太小({len(data)}B)，可能不是图片")
-        except Exception as e:
-            log(f"  · 方案1 失败: {e}")
+    if candidates:
+        log("  · 无水印原图候选均无效，转带水印兜底…")
+    else:
+        log("  · 未捕获到无水印原图 URL，转带水印兜底…")
 
-    # 方案2：blob 源 → 页面内 fetch 取回 base64
-    if src:
-        log(f"  · 尝试方案2（blob fetch base64）… src 类型: {'blob' if src.startswith('blob:') else '其他'}")
+    # ── 第二档：带水印页面资源（兜底）──
+    src = (img_info or {}).get("src") or ""
+    page_src = _largest_gen_image_src(page)
+    # wait_image 返回的 src 被截断到 200 字符，用页面完整 URL 补全
+    if src and page_src and page_src.startswith(src[:80]):
+        src = page_src
+    elif not src:
+        src = page_src
+    if not src:
+        log("  ! 页面未找到可用图片 src")
+        return None
+    log(f"  · 带水印下载: {src[:80]}…")
+
+    # blob: 只能页面内 fetch 取回 base64
+    if src.startswith("blob:"):
         try:
             res = page.eval_js(f"""
             (async ()=>{{
               const src={json.dumps(src)};
               try {{
                 const b=await (await fetch(src)).blob();
-                if(b.size > 100*1024*1024) return {{tooBig:true}};
+                if(b.size > 100*1024*1024) return null;
                 const buf=await b.arrayBuffer();
                 const bytes=new Uint8Array(buf);
                 let binary=''; const chunk=0x8000;
@@ -584,51 +464,58 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
                   binary+=String.fromCharCode.apply(null, bytes.subarray(i,i+chunk));
                 }}
                 return {{b64: btoa(binary), size: b.size}};
-              }} catch(e) {{
-                // canvas 兜底：找到 src 匹配的 img 元素
-                const img=[...document.querySelectorAll('img')]
-                  .find(i=>(i.currentSrc||i.src)===src);
-                if(!img) return null;
-                const c=document.createElement('canvas');
-                c.width=img.naturalWidth||img.width;
-                c.height=img.naturalHeight||img.height;
-                const ctx=c.getContext('2d');
-                ctx.drawImage(img,0,0);
-                const dataUrl=c.toDataURL('image/png');
-                return {{b64: dataUrl.split(',')[1], size: dataUrl.length}};
-              }}
+              }} catch(e) {{ return null; }}
             }})()
             """, await_promise=True, recv_timeout=120)
             if isinstance(res, dict) and res.get("b64"):
                 with open(filepath, "wb") as f:
                     f.write(base64.b64decode(res["b64"]))
-                if os.path.getsize(filepath) > 1024:
+                if _is_image_file(filepath):
+                    log(f"  · 带水印下载成功（blob fetch），{os.path.getsize(filepath) // 1024} KB")
                     return filepath
-        except CDPError:
+        except (CDPError, ValueError):
             pass
+        _discard_file(filepath)
+        return None
 
-    # 方案3：点击下载按钮
-    js_dl = """
-    (()=>{
-      const kws=['下载','保存','导出'];
-      const btns=[...document.querySelectorAll('button,[role=button],a')]
-        .filter(b=>{
-          if(b.offsetParent===null) return false;
-          const t=(b.innerText||b.getAttribute('aria-label')||b.getAttribute('title')||'').trim();
-          return t && kws.some(k=>t.includes(k));
-        });
-      if(btns.length){btns[0].click();return 'clicked';}
-      return null;
-    })()
-    """
+    # 1) Python 直链（urllib + Cookie + Referer）
+    if src.startswith(("http://", "https://")):
+        if _direct_download_image(page, src, filepath) and _is_image_file(filepath):
+            log(f"  · 带水印下载成功（直链），{os.path.getsize(filepath) // 1024} KB")
+            return filepath
+        _discard_file(filepath)
+
+    # 2) 页面内 fetch
     try:
-        if page.eval_js(js_dl):
-            log("  · 已触发下载按钮，浏览器将保存到默认下载目录")
-            log(f"  · 请手动把该文件改名/移动到: {filepath}")
-            return "DOWNLOAD_TRIGGERED"
+        fetched = page.download_via_fetch(src, filepath, timeout=30)
     except CDPError:
-        pass
+        fetched = False
+    if fetched and _is_image_file(filepath):
+        log(f"  · 带水印下载成功（页面 fetch），{os.path.getsize(filepath) // 1024} KB")
+        return filepath
+    _discard_file(filepath)
 
+    # 3) fetch(no-cors) + CDP getResponseBody
+    try:
+        native = page.download_native(src, filepath, timeout=60)
+    except CDPError:
+        native = False
+    if native and _is_image_file(filepath):
+        log(f"  · 带水印下载成功（download_native），{os.path.getsize(filepath) // 1024} KB")
+        return filepath
+    _discard_file(filepath)
+
+    # 4) new Image + CDP getResponseBody
+    try:
+        raw = page.download_raw(src, filepath, timeout=60)
+    except CDPError:
+        raw = False
+    if raw and _is_image_file(filepath):
+        log(f"  · 带水印下载成功（download_raw），{os.path.getsize(filepath) // 1024} KB")
+        return filepath
+    _discard_file(filepath)
+
+    log("  ! 带水印下载失败（直链 / fetch / CDP 均未取到有效图片）")
     return None
 
 
@@ -788,11 +675,11 @@ def generate_one(page: CDPPage, prompt: str, outdir: str, name: str, tag: str,
         if valid_refs:
             log(f"  · 图生图模式，上传参考图 {len(valid_refs)} 张: "
                 f"{', '.join(os.path.basename(p) for p in valid_refs)}")
-            try:
-                page.set_file_input(valid_refs)
-                time.sleep(3)  # 等待图片预览加载
-            except CDPError as e:
-                log(f"  ! 上传参考图失败: {e}，改用纯文本模式")
+            # 上传未确认成功就提交，豆包会退化成纯文生图，人物与参考图脱钩
+            if not upload_images(page, valid_refs, log_prefix="参考图"):
+                diag_snapshot(page, outdir, f"{name}_{tag}_upload_fail")
+                log("  ! 参考图未全部上传成功，已中止本次生成（不生成无参考图）")
+                return "failed", None
 
     if not fill_prompt(page, prompt):
         diag_snapshot(page, outdir, f"{name}_{tag}_fill_fail")
@@ -818,8 +705,6 @@ def generate_one(page: CDPPage, prompt: str, outdir: str, name: str, tag: str,
 
     log("  · 图片已生成，开始下载…")
     path = download_image(page, outdir, name, tag, img_info=img, expect_portrait=expect_portrait)
-    if path == "DOWNLOAD_TRIGGERED":
-        return "ok", path
     if path:
         size = os.path.getsize(path) / 1024
         log(f"  · 已下载: {path} ({size:.0f} KB)")
