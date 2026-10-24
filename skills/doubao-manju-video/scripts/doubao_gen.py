@@ -453,7 +453,7 @@ def _card_fingerprint(card_text: str) -> str:
 
 
 def _find_pending_card(state: dict, anchor_hash, confirmed_card_hashes: set,
-                       confirmed_params: set):
+                       confirmed_params: set, prompt_idx=None):
     """
     事件驱动模式的新卡判定（不变量 N1/N3 的实现）。
 
@@ -461,7 +461,12 @@ def _find_pending_card(state: dict, anchor_hash, confirmed_card_hashes: set,
       1. 时序锚点：anchor_hash 是最近一次**已送达**确认的用户消息 hash。
          卡片消息必须位于 anchor 之后（i > anchor 的当前 idx）才算新卡——
          同一张卡流式更新（i 不变）与历史旧卡（在 anchor 之前）都不触发。
-      2. anchor 缺席 fallback（被虚拟化卸载，罕见）：参数指纹未见过才算新卡。
+      2. prompt 锚点（anchor 缺席时，即本镜首轮确认前）：卡片必须位于
+         本镜提示词消息之后（i > prompt_idx）——上一镜残留卡（回放卡/
+         二次卡，i < prompt_idx）绝不确认（2026-10-25 用户实锤「豆包
+         还没回复就提前发确认」的根因：prompt 未渲染时 _prompt_idx 取到
+         上一镜确认消息，残留卡漏锁 + fallback 纯指纹判据误判新卡）。
+      3. 双锚点都缺席（极端兜底）：参数指纹未见过才算新卡。
     返回待确认卡消息 dict 或 None。卡片自身的 hash 去重由调用方记录
     （confirmed_card_hashes：确认成功送达后加入，同一元素绝不重复确认）。
     """
@@ -482,8 +487,14 @@ def _find_pending_card(state: dict, anchor_hash, confirmed_card_hashes: set,
             if c.get("i", -1) > anchor_idx:
                 return c  # anchor 之后的新卡 → 待确认
             # anchor 之前的卡 = 历史旧卡（N3：绝不确认）
+        elif prompt_idx is not None:
+            # prompt 锚点：只有本镜提示词**之后**豆包回的卡才算新卡；
+            # 残留旧卡（i <= prompt_idx）一律拦截（N3 补全）
+            if c.get("i", -1) > prompt_idx \
+                    and _card_fingerprint(c.get("text") or "") not in confirmed_params:
+                return c
         else:
-            # anchor 被卸载的 fallback：参数指纹判据
+            # 双锚点缺席的 fallback：参数指纹判据
             if _card_fingerprint(c.get("text") or "") not in confirmed_params:
                 return c
     return None
@@ -528,7 +539,8 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                 expect_style_key: str | None = None,
                 timeout: int = RENDER_TIMEOUT,
                 prev_known_srcs: set[str] | None = None,
-                allow_paid: bool = False):
+                allow_paid: bool = False,
+                prompt_baseline_hashes: set | None = None):
     """
     事件驱动的渲染等待状态机（2026-10-24 任务G 重构；用户指正：旧 5s 轮询
     在确认失效后后台空等到 900s 超时，且 innerText 计数判据在豆包虚拟化
@@ -623,29 +635,58 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     event_armed = doubao_events.arm(page)
     if event_armed:
         log("  · 事件驱动模式已启用（MutationObserver 推送，响应 <2s，替代 5s 轮询）")
-        # N3 基线锁定：本镜提示词消息（当前最后一条 U 消息）**之前**的所有卡片
-        # 都算历史旧卡，预先加入 confirmed 集合，绝不重复确认。
-        # 双重防误锁：只锁 i < 提示词 idx 的卡——即使豆包已秒回本镜新卡
-        # （i > 提示词 idx，物理上新消息元素）也不会被误锁进基线
-        # （2026-10-24 教训的锚点制版：旧轮次键制不能预锁是因为计数会碰撞，
-        #  hash 制预锁的只是提交前已存在的物理元素，本镜新卡必然是新 hash）
-        try:
-            _base_snap = doubao_events.poll_snapshot(page)
-            _base_msgs = doubao_events.snapshot_msgs(_base_snap)
-            _prompt_idx = max((m.get("i", -1) for m in _base_msgs if m.get("r") == "U"),
-                              default=-1)
-            for _m in _base_msgs:
-                if _m.get("r") == "B" and (_m.get("card") or _m.get("ask")) \
-                        and _m.get("i", -1) < _prompt_idx:
-                    confirmed_card_hashes.add(_m.get("h"))
-                    confirmed_params.add(_card_fingerprint(_m.get("text") or ""))
-            if confirmed_card_hashes:
-                log(f"  · 已锁定 {len(confirmed_card_hashes)} 张历史卡片（N3 基线，"
-                    f"绝不重复确认）")
-        except Exception:
-            pass
     else:
         log("  ! 观察器注入失败，自动降级为轮询模式（5s）")
+
+    # ── prompt 送达锚定（2026-10-25 用户实锤修复：「豆包还没回复就提前发确认」）──
+    # submit 后豆包渲染 prompt 的 U 消息有延迟。若不等它出现就做 N3 基线锁定，
+    # 「最后一条 U 消息」会取到上一镜的确认消息 → 上一镜残留卡（回放卡/二次卡）
+    # 漏锁 → fallback 指纹判据误判新卡 → 提前对残留卡发确认。
+    # 修复：用 submit 前采集的 U 消息基线（prompt_baseline_hashes），等待
+    # 「基线外的新 U 消息」（= 本镜 prompt 已进入会话）出现后才进入确认判定；
+    # 豆包的任何卡片必须位于 prompt 之后才算新卡（i > prompt_idx）。
+    prompt_idx = None
+    if prompt_baseline_hashes is not None:
+        _p_deadline = time.time() + 8  # 最多等 8s（正常 <1s）
+        _prompt_msg = None
+        while time.time() < _p_deadline:
+            _snap = doubao_events.poll_snapshot(page)
+            for _m in doubao_events.snapshot_msgs(_snap):
+                if _m.get("r") == "U" and _m.get("h") not in prompt_baseline_hashes:
+                    _prompt_msg = _m
+                    break
+            if _prompt_msg is not None:
+                break
+            time.sleep(0.5)
+        if _prompt_msg is not None:
+            prompt_idx = _prompt_msg.get("i", -1)
+            log(f"  · 提示词已送达会话（消息 #{prompt_idx}），开始等待豆包回复")
+        else:
+            log("  ! 8s 内未见提示词消息出现在会话中（提交可能失败），"
+                "按旧基线继续（谨慎模式）")
+
+    # N3 基线锁定（双模式）：prompt_idx（或最后一条 U 消息）**之前**的所有卡片
+    # 都算历史旧卡，预先加入 confirmed 集合，绝不重复确认。
+    # 双重防误锁：只锁 i < 锚点 idx 的卡——即使豆包已秒回本镜新卡
+    # （i > 锚点 idx，物理上新消息元素）也不会被误锁进基线。
+    # 2026-10-25：从事件模式分支提出到双模式——降级模式（arm 失败全程轮询）
+    # 此前无任何旧卡防护，残留卡轮次键必然不在新 set → 立即提前确认。
+    try:
+        _base_snap = doubao_events.poll_snapshot(page)
+        _base_msgs = doubao_events.snapshot_msgs(_base_snap)
+        if prompt_idx is None:
+            prompt_idx = max((m.get("i", -1) for m in _base_msgs if m.get("r") == "U"),
+                             default=-1)
+        for _m in _base_msgs:
+            if _m.get("r") == "B" and (_m.get("card") or _m.get("ask")) \
+                    and _m.get("i", -1) < prompt_idx:
+                confirmed_card_hashes.add(_m.get("h"))
+                confirmed_params.add(_card_fingerprint(_m.get("text") or ""))
+        if confirmed_card_hashes:
+            log(f"  · 已锁定 {len(confirmed_card_hashes)} 张历史卡片（N3 基线，"
+                f"绝不重复确认）")
+    except Exception:
+        pass
     last_poll_sig = None  # 兜底巡检的快照指纹（用于判断是否实质变化）
 
     while time.time() < deadline:
@@ -867,7 +908,8 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
             # 不变量 N1/N3）；降级模式沿用轮次键制（innerText 计数，有已知漂移风险）。
             if event_armed:
                 pending = _find_pending_card(state, anchor_hash,
-                                             confirmed_card_hashes, confirmed_params)
+                                             confirmed_card_hashes, confirmed_params,
+                                             prompt_idx=prompt_idx)
                 card_text = (pending.get("text") or "") if pending else ""
                 round_key = None
                 is_new_round = pending is not None
@@ -1396,6 +1438,16 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     time.sleep(0.8)
     set_duration(page, secs)
 
+    # prompt 送达锚定基线（2026-10-25）：提交前已存在的用户消息 hash 集合。
+    # wait_render 据此等待「基线外新 U 消息」（= 本镜 prompt）出现后才进入
+    # 确认判定，杜绝豆包还没回复就对上一镜残留卡提前发确认。
+    try:
+        _pre_snap = doubao_events.poll_snapshot(page)
+        prompt_baseline = {m.get("h") for m in doubao_events.snapshot_msgs(_pre_snap)
+                           if m.get("r") == "U"}
+    except Exception:
+        prompt_baseline = set()
+
     if not submit_prompt(page):
         log("  ! 提交失败（可能额度用尽或需要人工确认）")
         diag_snapshot(page, outdir, f"shot_{idx:02d}_submit_fail")
@@ -1404,7 +1456,8 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     log("  · 已提交，等待渲染…")
     video, error_tag = wait_render(page, before, expect_seconds=secs, expect_style_key=style_key,
                                     prev_known_srcs=_KNOWN_VIDEO_SRCS,
-                                    allow_paid=allow_paid)
+                                    allow_paid=allow_paid,
+                                    prompt_baseline_hashes=prompt_baseline)
 
     if error_tag == "quota":
         return "quota", None

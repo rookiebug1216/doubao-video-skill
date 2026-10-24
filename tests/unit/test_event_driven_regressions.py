@@ -190,10 +190,12 @@ class TestFindPendingCard:
 
     def test_n3_baseline_prelock_semantics(self):
         """R3 跨镜场景：N3 基线把提示词之前的旧卡预先锁进 confirmed_card_hashes，
-        锚点判据直接跳过 —— wait_render 源码必须实现该预锁。"""
+        锚点判据直接跳过 —— wait_render 源码必须实现该预锁。
+        （2026-10-25：变量 _prompt_idx 统一为 prompt_idx，且升级为
+        prompt 送达锚定 + 双模式预锁，见 TestPromptAnchor）"""
         src = inspect.getsource(doubao_gen.wait_render)
         assert "N3 基线锁定" in src
-        assert "_prompt_idx" in src
+        assert "prompt_idx" in src
         assert "confirmed_card_hashes.add" in src
 
     def test_anchor_missing_fallback_fingerprint(self):
@@ -367,3 +369,78 @@ class TestE2eHardening:
         变体也必须触发 project_root 推导。"""
         src = inspect.getsource(doubao_gen.main)
         assert '.lower() == "storyboard"' in src, "storyboard 目录匹配必须大小写不敏感"
+
+
+# ──────────────────────────────────────────────────────────────
+# prompt 送达锚定（2026-10-25 用户实锤：「豆包还没回复就提前发确认」）
+# ──────────────────────────────────────────────────────────────
+
+class TestPromptAnchor:
+    """提前确认修复：确认动作必须发生在「本镜 prompt 之后豆包回的卡」上。
+
+    根因（同会话连续生成场景）：
+      submit 后 prompt 的 U 消息渲染有延迟 → N3 预锁的「最后一条 U 消息」
+      取到上一镜确认消息 → 上一镜残留卡（回放卡/二次卡）漏锁 →
+      anchor=None 的 fallback 纯指纹判据误判新卡 → 豆包还没回复本镜，
+      脚本就先发「确认，开始生成视频」。
+    """
+
+    def test_prompt_idx_blocks_residual_card(self):
+        """R6：anchor 缺席（首轮确认前）时，prompt 锚点必须拦截上一镜
+        残留卡（i <= prompt_idx），即使其指纹从未确认过。"""
+        # 消息序列：残留卡(i=3) → 上一镜确认(i=4) → 本镜 prompt(i=5) → 无新卡
+        msgs = [
+            _msg(3, "B", CARD_TEXT, card=True),
+            _msg(4, "U", "确认，开始生成视频", h="h_confirm_old"),
+            _msg(5, "U", "本镜提示词……", h="h_prompt"),
+        ]
+        state = {"msgs": msgs}
+        pending = doubao_gen._find_pending_card(
+            state, None, set(), set(), prompt_idx=5)
+        assert pending is None, "残留卡（i=3 < prompt_idx=5）不得被判为新卡"
+
+    def test_prompt_idx_allows_new_card_after_prompt(self):
+        """R7：豆包在本镜 prompt 之后回的新卡（i > prompt_idx）必须正常确认。"""
+        msgs = [
+            _msg(3, "B", CARD_TEXT, card=True),
+            _msg(4, "U", "确认，开始生成视频", h="h_confirm_old"),
+            _msg(5, "U", "本镜提示词……", h="h_prompt"),
+            _msg(6, "B", CARD_TEXT_2, card=True),  # 豆包回的本镜新卡
+        ]
+        state = {"msgs": msgs}
+        pending = doubao_gen._find_pending_card(
+            state, None, set(), set(), prompt_idx=5)
+        assert pending is not None and pending.get("i") == 6, \
+            "prompt 之后的新卡必须被判为待确认"
+
+    def test_dual_anchor_absent_falls_back_to_fingerprint(self):
+        """R8：anchor 与 prompt_idx 双缺席（极端兜底）退回纯指纹判据，
+        保持旧行为不回归。"""
+        msgs = [_msg(3, "B", CARD_TEXT, card=True)]
+        state = {"msgs": msgs}
+        # 指纹未见 → 判新卡（旧行为）
+        assert doubao_gen._find_pending_card(state, None, set(), set()) is not None
+        # 指纹已确认 → None
+        fp = doubao_gen._card_fingerprint(CARD_TEXT)
+        assert doubao_gen._find_pending_card(state, None, set(), {fp}) is None
+
+    def test_wait_render_waits_for_prompt_delivery(self):
+        """wait_render 必须先等待「基线外新 U 消息」（本镜 prompt 送达会话）
+        出现后才进入确认判定，且 N3 预锁对双模式生效（降级模式此前无
+        旧卡防护，残留卡轮次键必然不在新 set → 立即提前确认）。"""
+        src = inspect.getsource(doubao_gen.wait_render)
+        assert "prompt_baseline_hashes" in src, "缺 prompt 基线参数"
+        assert "提示词已送达会话" in src, "缺 prompt 送达等待日志"
+        assert "N3 基线锁定（双模式）" in src, "N3 预锁必须在事件/降级双模式下执行"
+        # prompt_idx 必须传入 _find_pending_card
+        assert "prompt_idx=prompt_idx" in src, "未把 prompt_idx 传给判卡函数"
+
+    def test_generate_shot_collects_baseline_before_submit(self):
+        """generate_shot 必须在 submit 前采集 U 消息基线并传入 wait_render。"""
+        src = inspect.getsource(doubao_gen.generate_shot)
+        assert "prompt_baseline = {m.get(\"h\")" in src, "缺基线采集"
+        # 采集必须在 submit_prompt 之前（时序正确性）
+        collect_pos = src.find("prompt_baseline = {m.get")
+        submit_pos = src.find("if not submit_prompt(page)")
+        assert 0 < collect_pos < submit_pos, "基线采集必须先于 submit"
+        assert "prompt_baseline_hashes=prompt_baseline" in src, "未传入 wait_render"
