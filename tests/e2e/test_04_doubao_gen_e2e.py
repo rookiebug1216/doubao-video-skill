@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Step 4：视频生成 + 无水印下载验证（需 --unlock）（消耗 1 次额度）。
+Step 4：视频生成 + 无水印下载验证（无水印默认开启）（消耗 1 次额度）。
 
 前置：
   - Step 3 全绿（first_char_ref_path fixture 校验通过）
@@ -44,7 +44,6 @@ def _run_doubao_gen():
         "--char-refs", char_refs,
         "--only", "1",
         "--keep-tab",
-        "--unlock",
     ]
     # 渲染超时 15 分钟，加 buffer 取 25 分钟
     return subprocess.run(cmd, cwd=_ROOT, capture_output=True, text=True,

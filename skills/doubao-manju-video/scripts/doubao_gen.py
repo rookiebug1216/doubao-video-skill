@@ -309,39 +309,66 @@ def send_confirmation(page: CDPPage, allow_text: bool = True) -> str:
 
     allow_text=False 用于"点完按钮后的二次按钮探测"：只找按钮，绝不再发文本，
     避免同一张卡被重复发送多条"确认"消息（可能触发重复生成、多扣额度）。
+
+    2026-10-24 修复两点：
+      1) 按钮点击改用 CDP 真实鼠标点击 —— 合成 hit.click() 不走 React onClick，
+         点了没反应（与发送按钮同一个坑）。
+      2) 新版豆包的参数卡**根本没有按钮**，只有一句"确认后我再开始生成视频"，
+         必须走文本兜底（回复"确认，开始生成视频"）。
     """
-    js_btn = """
+    # ── 方案1：真实鼠标点击确认类按钮 ──
+    js_locate = """
     (()=>{
       const kws=['确认生成','开始生成','立即生成'];
-      // 扩大搜索范围：button、role=button、div、span、a —— 只要可见且文字匹配
       const all=[...document.querySelectorAll('button,[role=button],div[class*=btn],div[class*=button],span[class*=btn],a')]
-        .filter(e=>e.offsetParent!==null);
-      // 优先精确匹配（不含"确认"泛词）
+        .filter(e=>e.offsetParent!==null || e.getClientRects().length);
       for(const kw of kws){
         const hit=all.find(e=>{
           const t=(e.innerText||'').trim();
           return t && t.length<15 && t.includes(kw);
         });
-        if(hit){hit.click();return 'button:'+(hit.innerText||'').trim();}
+        if(hit){
+          const r=hit.getBoundingClientRect();
+          if(r.width<4||r.height<4) return null;
+          return JSON.stringify({x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2),
+            text:(hit.innerText||'').trim(), disabled: !!hit.disabled});
+        }
       }
-      // 兜底：单独"确认"按钮
       const hit=all.find(e=>{
         const t=(e.innerText||'').trim();
         return t==='确认' || t==='确认生成';
       });
-      if(hit){hit.click();return 'button:'+(hit.innerText||'').trim();}
+      if(hit){
+        const r=hit.getBoundingClientRect();
+        if(r.width<4||r.height<4) return null;
+        return JSON.stringify({x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2),
+          text:(hit.innerText||'').trim(), disabled: !!hit.disabled});
+      }
       return null;
     })()
     """
     try:
-        res = page.eval_js(js_btn)
-        if res:
-            return res
-    except CDPError:
+        loc = page.eval_js(js_locate)
+        if loc:
+            loc = json.loads(loc) if isinstance(loc, str) else loc
+            if not loc.get("disabled"):
+                for evt in ("mouseMoved", "mousePressed", "mouseReleased"):
+                    page.call("Input.dispatchMouseEvent", recv_timeout=15,
+                              type=evt, x=loc["x"], y=loc["y"],
+                              button="left", clickCount=1)
+                time.sleep(1.5)
+                return "button:" + loc.get("text", "")
+    except (CDPError, json.JSONDecodeError):
         pass
-    # 文本回复兜底（仅在主确认时允许；二次按钮探测禁止发文本）
-    if allow_text and fill_prompt(page, "确认，开始生成视频") and submit_prompt(page):
-        return "text"
+
+    # ── 方案2：文本回复兜底 ──
+    # 新版豆包参数卡没有按钮，只有"确认后我再开始生成视频"文案 → 必须发文本。
+    if allow_text:
+        try:
+            if fill_prompt(page, "确认，开始生成视频") and submit_prompt(page):
+                return "text"
+        except CDPError as e:
+            log(f"  ! 文本确认失败: {e}")
     return "none"
 
 
@@ -390,6 +417,7 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     # 若一锁到底就会永远不确认、镜卡死不出片（2026-10-23 用户截图实锤）。
     confirmed_rounds: set = set()              # 已确认过的轮次键
     clicked_buttons: set[str] = set()
+    confirm_fail = 0                           # 连续确认失败次数（防止无限重试）
     # 提交时刻的回复基线：
     #  - 历史错误不算"新增"；
     #  - 上一镜残留的参数卡不许被当成新卡重复确认（连续生成时同一标签同一会话）。
@@ -400,12 +428,16 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     try:
         _pre = read_reply_state(page)
         pre_errors = set(_pre.get("errors", []))
+        # 2026-10-24 修复：这里**不能**把页面已有的参数卡计入 confirmed_rounds。
+        # 原逻辑把起始时页面上出现的卡片当作"已确认过"，于是 round_key 预先被锁定，
+        # is_new_round 恒为 False → 本镜永远不会触发确认，镜卡死在
+        # "确认后我再开始生成视频"处直到超时（用户截图实锤）。
+        # 起始时的卡片只应作为"错误文案基线"使用，卡片本身要留给本轮确认。
         _pre_titles = int(_pre.get("cardTitles", 0) or 0)
         _pre_asks = int(_pre.get("askCount", 0) or 0)
-        if _pre_titles > 0:
-            confirmed_rounds.add(("title", _pre_titles))
-        if _pre_asks > 0:
-            confirmed_rounds.add(("ask", _pre_asks))
+        if _pre_titles > 0 or _pre_asks > 0:
+            log(f"  · 页面已存在参数卡（标题×{_pre_titles} 催确认×{_pre_asks}），"
+                f"本镜将重新确认")
     except Exception:
         pass
     # 基线视频指纹：豆包会对历史消息里的旧视频做虚拟化卸载（DOM 里时有时无），
@@ -414,9 +446,11 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     # 被虚拟化卸载出 DOM 后又被 lazy-load 重新插入时被误判为新镜出片。
     baseline_srcs = set(prev_known_srcs or [])
     try:
+        # 2026-10-24：不再截断到 150 字符 —— 豆包 CDN 的视频 URL 带签名参数，
+        # 截断后下载会 403；且本镜 src 要原样传给 download_video。
         raw = page.eval_js("""
         JSON.stringify([...document.querySelectorAll('video')]
-          .map(v=>(v.currentSrc||v.src||'').slice(0,150)).filter(Boolean))
+          .map(v=>(v.currentSrc||v.src||'')).filter(Boolean))
         """)
         baseline_srcs.update(json.loads(raw) if isinstance(raw, str) else [])
     except Exception:
@@ -440,7 +474,7 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
               const info=vids.map(v=>({
                 dur: v.duration && isFinite(v.duration) ? v.duration : 0,
                 ready: v.readyState,
-                src: (v.currentSrc||v.src||'').slice(0,150)
+                src: (v.currentSrc||v.src||'')
               }));
               return JSON.stringify({
                 n: vids.length,
@@ -457,11 +491,20 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                      if v.get("dur", 0) >= 3 and v.get("src")
                      and v["src"] not in baseline_srcs]
             if fresh:
-                return fresh[-1], None
+                # 把基线随出片一起返回：generate_shot 下载时要用它做 exclude
+                # （2026-10-24 实跑 NameError 实锤：此前 generate_shot 直接引用
+                #  wait_render 的局部变量 baseline_srcs，属未定义名称，出片后
+                #  下载阶段必崩 —— 镜02 渲染成功却崩在下载，白扣 1 次额度）
+                out = fresh[-1]
+                out["baseline_srcs"] = baseline_srcs
+                return out, None
             # 兜底：拿不到 src 时退回计数对比
             done_cnt = len([v for v in vids if v.get("dur", 0) >= 3])
             if done_cnt > before_count or (before_count == 0 and done_cnt > 0):
-                return (vids[-1] if vids else None), None
+                out = vids[-1] if vids else None
+                if out:
+                    out["baseline_srcs"] = baseline_srcs
+                return out, None
 
             # 状态1.5：豆包新版需点击播放图标才会注入 <video> 元素
             # 检测到 .play-icon-wrapper 存在且本镜尚未点过 → CDP 真实鼠标点击触发 video 加载
@@ -602,7 +645,6 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
             round_key = _confirm_round_key(state)
             is_new_round = bool(state.get("hasCard")) and round_key not in confirmed_rounds
             if is_new_round and confirm_count < 3:
-                confirmed_rounds.add(round_key)
                 log("  · 豆包回复「视频生成参数确认」卡：")
                 if params.get("model"):
                     log(f"      模型 {params['model']}")
@@ -622,7 +664,14 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                     log(f"      风格 {s}{warn}")
                 action = send_confirmation(page)
                 if action != "none":
+                    # 只有真正确认成功才锁定本轮 —— 2026-10-24 修复：
+                    # 原先无论成败都先 confirmed_rounds.add(round_key)，
+                    # 一旦首次确认失败（合成 click 无效 / 文本没发出去），
+                    # 后续 is_new_round 恒为 False → 永远不再重试，
+                    # 镜卡死在"确认后我再开始生成视频"处直到超时。
+                    confirmed_rounds.add(round_key)
                     confirm_count += 1
+                    confirm_fail = 0
                     log(f"  · 已自动确认第 {confirm_count} 轮（{action}），等待渲染开始")
                     time.sleep(2)
                     # 卡片确认后再找一次"确认生成"按钮（可能需要二次按钮点击）；
@@ -633,7 +682,12 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                         log(f"  · 二次确认按钮: {action2}")
                         time.sleep(3)
                 else:
-                    log("  ! 无法完成本轮确认（无确认按钮且消息发送失败）")
+                    confirm_fail += 1
+                    log(f"  ! 本轮确认未成功，将重试（不锁定轮次）"
+                        f"[连续失败 {confirm_fail}]")
+                    if confirm_fail >= 8:
+                        log("  ! 连续确认失败 8 次，放弃本镜")
+                        return None, None
             elif not state.get("hasCard") and confirm_count < 3:
                 # 非卡片状态下也检查"确认生成"按钮（豆包可能有多个确认步骤），
                 # 同一文本的按钮只点一次（clicked_buttons 去重）。
@@ -641,25 +695,36 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                 # 主循环永不进此分支，二次确认按钮若未在 action2 检测窗口期内出现
                 # （2s 太短），后续永远不会被点，镜卡死在"确认生成"按钮处。
                 try:
-                    btn_res = page.eval_js("""
+                    # 2026-10-24：合成 hit.click() 不走 React onClick → 改真实鼠标点击
+                    btn_loc = page.eval_js("""
                     (()=>{
                       const kws=['确认生成','开始生成','立即生成'];
                       const btns=[...document.querySelectorAll('button,[role=button]')]
-                        .filter(b=>b.offsetParent!==null && !b.disabled);
+                        .filter(b=>(b.offsetParent!==null||b.getClientRects().length) && !b.disabled);
                       const hit=btns.find(b=>{
                         const t=(b.innerText||'').trim();
                         return t && t.length<12 && kws.some(k=>t.includes(k));
                       });
-                      if(hit){hit.click();return 'button:'+(hit.innerText||'').trim();}
-                      return null;
+                      if(!hit) return null;
+                      const r=hit.getBoundingClientRect();
+                      if(r.width<4||r.height<4) return null;
+                      return JSON.stringify({x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2),
+                        text:(hit.innerText||'').trim()});
                     })()
                     """)
-                    if btn_res and btn_res not in clicked_buttons:
-                        clicked_buttons.add(btn_res)
-                        confirm_count += 1
-                        log(f"  · 点击确认按钮: {btn_res}")
-                        time.sleep(3)
-                except CDPError:
+                    if btn_loc:
+                        btn_loc = json.loads(btn_loc) if isinstance(btn_loc, str) else btn_loc
+                        btn_res = "button:" + btn_loc.get("text", "")
+                        if btn_res not in clicked_buttons:
+                            clicked_buttons.add(btn_res)
+                            for evt in ("mouseMoved", "mousePressed", "mouseReleased"):
+                                page.call("Input.dispatchMouseEvent", recv_timeout=15,
+                                          type=evt, x=btn_loc["x"], y=btn_loc["y"],
+                                          button="left", clickCount=1)
+                            confirm_count += 1
+                            log(f"  · 点击确认按钮: {btn_res}")
+                            time.sleep(3)
+                except (CDPError, json.JSONDecodeError):
                     pass
 
             # 进度提示
@@ -674,15 +739,34 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     return None, None
 
 
-def get_video_src(page: CDPPage) -> str | None:
+def get_video_src(page: CDPPage, exclude: set | None = None) -> str | None:
+    """取页面中视频元素的 src。
+
+    2026-10-24 修复：豆包 SPA 会在 DOM 中保留上一镜的 <video> 元素。
+    原实现取"最后一个 duration>=3 的 video"，当本镜新视频 duration 尚未
+    就绪（0/NaN）时，会错误地返回上一镜的 src —— 实测镜03 下载到了镜02 的
+    mp4（两者 MD5 完全相同）。
+    修法：exclude 参数传入已知的旧 src（基线 + 跨镜已知），只取不在其中的。
+    """
+    exclude = exclude or set()
     js = """
     (()=>{
+      const EX = %s;
       const vids=[...document.querySelectorAll('video')];
-      const v=vids.filter(x=>x.duration>=3).pop() || vids.pop();
-      if(!v) return null;
-      return (v.currentSrc||v.src||'') || null;
+      const pick = v => {
+        const s=(v.currentSrc||v.src||'');
+        if(!s) return null;
+        for(const e of EX){ if(s===e || s.startsWith(e) || e.startsWith(s)) return null; }
+        return s;
+      };
+      // 优先：duration 已就绪且不在排除集里的
+      const ready=vids.filter(v=>v.duration>=3).map(pick).filter(Boolean);
+      if(ready.length) return ready[ready.length-1];
+      // 其次：任意不在排除集里的
+      const any=vids.map(pick).filter(Boolean);
+      return any.length?any[any.length-1]:null;
     })()
-    """
+    """ % json.dumps(sorted(exclude))
     try:
         return page.eval_js(js)
     except CDPError:
@@ -706,7 +790,8 @@ def _is_mp4_file(filepath: str) -> bool:
     return _is_mp4_bytes(data)
 
 
-def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str | None:
+def download_video(page: CDPPage, outdir: str, index: int, seconds: int,
+                   preferred_src: str = "", exclude_srcs: set = None) -> str | None:
     """
     下载视频，只保留两档策略（按优先级）：
       1) 无水印原片：捕获 fallback_api → logo_type=unwatermarked → qAAB 解密
@@ -715,6 +800,11 @@ def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str 
          a. https 直链：带 Cookie/Referer 直接下载（CDN 资源通常需要登录态）
          b. blob: 源：页面内 fetch -> base64 取回（CDN 直链拿不到时的兜底）
          两种方式都必须通过 mp4 文件头校验才落盘，非 mp4 内容直接丢弃。
+
+    preferred_src：wait_render 已确认的本镜视频 src —— 优先使用，
+        避免重新在 DOM 里搜索时取到上一镜残留的 <video>（实测会下载到
+        上一镜的 mp4，两者 MD5 相同）。
+    exclude_srcs：已知的旧 src 集合（基线 + 跨镜已知），搜索时排除。
     """
     os.makedirs(outdir, exist_ok=True)
     filename = f"shot_{index:02d}_{seconds}s.mp4"
@@ -730,7 +820,8 @@ def download_video(page: CDPPage, outdir: str, index: int, seconds: int) -> str 
     except CDPError as e:
         log(f"  · 无水印原片获取异常，降级下载带水印页面资源: {e}")
 
-    src = get_video_src(page)
+    # 优先用 wait_render 确认的本镜 src；否则在 DOM 里搜（排除旧 src）
+    src = preferred_src or get_video_src(page, exclude=exclude_srcs)
 
     # 方案1：https 直链 + Cookie（落盘前校验 mp4）
     if src and src.startswith(("http://", "https://")) and not src.startswith("blob:"):
@@ -1065,7 +1156,9 @@ def generate_shot(page: CDPPage, shot: dict, outdir: str, style_key: str | None 
     # 把本镜新出片 src 记入跨镜基线，供下一镜 wait_render 防误判
     if video.get("src"):
         _KNOWN_VIDEO_SRCS.add(video["src"])
-    path = download_video(page, outdir, idx, secs)
+    path = download_video(page, outdir, idx, secs,
+                          preferred_src=video.get("src"),
+                          exclude_srcs=video.get("baseline_srcs", set()) | set(_KNOWN_VIDEO_SRCS))
     if path:
         size = os.path.getsize(path) / 1024 / 1024
         log(f"  · 已下载: {path} ({size:.1f} MB)")
@@ -1118,8 +1211,8 @@ def main():
     ap.add_argument("--continue-on-error", action="store_true", help="单镜失败后继续下一镜")
     ap.add_argument("--allow-paid", action="store_true",
                     help="豆包询问付费额度（免费额度已用完）时，自动点「确认生成」按钮继续（默认 False：跳过本镜记录待补）")
-    ap.add_argument("--unlock", action="store_true",
-                    help="启用视频无水印下载（默认关闭；图片始终优先下载无水印原图，不受此开关影响）")
+    ap.add_argument("--no-unlock", action="store_true",
+                    help="禁用视频无水印下载（默认开启；图片始终优先下载无水印原图，不受此开关影响）")
     ap.add_argument("--char-refs", default=None,
                     help="角色参考图索引 JSON（char_refs_index.json），用于图生视频时上传参考图")
     ap.add_argument("--props-refs", default=None,
@@ -1285,11 +1378,14 @@ def main():
     # ── 打开浏览器 + 登录 ──
     cdp_browser.ensure_browser(args.port, args.browser, args.profile_dir)
     log("\n正在打开豆包…")
+    # 独立新标签页：复用已有标签页时豆包可能把新提示词当成旧会话的追问，
+    # 或把生成结果渲染到别的标签页，导致本页等不到图。
     tid = cdp_browser.new_tab(args.port, DOUBAO_HOME)
+    created_tid = tid
     page = CDPPage(args.port, tid)
 
     # 在页面任何请求发出前安装无水印媒体捕获钩子（内部会重导航一次）
-    if args.unlock:
+    if not args.no_unlock:
         media_unlock.arm(page, DOUBAO_HOME)
 
     try:
@@ -1439,9 +1535,12 @@ def main():
         log("=" * 62)
 
     finally:
-        if not args.keep_tab and tid:
+        # 只关闭本次自己新建的标签页；复用来的属于用户会话，保留。
+        if not args.keep_tab and tid and tid == created_tid:
             page.close_tab()
             log("\n已关闭本次创建的标签页。")
+        elif tid:
+            log("\n已保留复用的豆包标签页（未关闭）。")
 
 
 if __name__ == "__main__":

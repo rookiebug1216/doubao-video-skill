@@ -256,9 +256,13 @@ def main():
     # ── 打开浏览器 + 登录 ──
     cdp_browser.ensure_browser(args.port, args.browser, args.profile_dir)
     log("\n正在打开豆包…")
+    # 每个任务用独立的新标签页。
+    # 2026-10-24 实测：复用已有标签页时，豆包可能把新提示词当成对旧会话的
+    # 追问（只回文字建议不出图），或把结果渲染到别的标签页导致本页等不到。
+    # 新开标签页 + 空白会话是最稳的组合。
     tid = cdp_browser.new_tab(args.port, DOUBAO_HOME)
+    created_tid = tid
     page = CDPPage(args.port, tid)
-
     results = []
     failed = []
     quota_hit = False
@@ -275,12 +279,23 @@ def main():
 
         task_idx = 0
 
+        def fresh_session():
+            """每个任务前新建独立会话。
+
+            豆包在「已有对话」里收到新提示词时，可能把它当成对话追问——
+            只回文字建议而不出新图（2026-10-24 实测：三次出图任务全部命中，
+            表现为持续等待直至超时）。因此每个任务必须从空白会话发起。
+            """
+            if not doubao_page.new_conversation(page, timeout=60):
+                log("  ! 新建会话失败，沿用当前页面继续提交")
+
         # ── 角色六视图 ──
         for c in characters:
             task_idx += 1
             log(f"\n{'─'*62}")
             log(f"进度 {task_idx}/{total_tasks} · 角色")
             prompt = build_sixview_prompt(c["name"], c["desc"], style_key, char_data=c)
+            fresh_session()
             status, path = generate_one(page, prompt, out_dir, c["name"], "六视图")
             results.append({"type": "character", "name": c["name"], "desc": c["desc"],
                             "status": status, "path": path})
@@ -301,6 +316,7 @@ def main():
                 log(f"\n{'─'*62}")
                 log(f"进度 {task_idx}/{total_tasks} · 道具")
                 prompt = build_prop_prompt(p["name"], p["desc"], style_key, prop_data=p)
+                fresh_session()
                 status, path = generate_one(page, prompt, out_dir, p["name"], "道具")
                 results.append({"type": "prop", "name": p["name"], "desc": p["desc"],
                                 "status": status, "path": path})
@@ -332,16 +348,40 @@ def main():
             log("中止原因: 免费额度耗尽（明天刷新后续跑）")
 
         index_path = os.path.join(out_dir, "char_refs_index.json")
+        # 2026-10-24 修复：索引必须与已有记录合并，不能整体覆盖。
+        # 续跑（--only N）时只生成了部分角色，若直接覆盖，旧的成功记录会丢失，
+        # 导致 doubao_gen.py 找不到该角色的参考图（"角色「X」无参考图，跳过"），
+        # 人物一致性锚定静默失效。
+        prev_results = []
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, encoding="utf-8") as f:
+                    prev = json.load(f)
+                prev_results = prev.get("results", []) or []
+            except (OSError, json.JSONDecodeError):
+                prev_results = []
+
+        merged = {}
+        for r in prev_results + results:
+            key = (r.get("type"), r.get("name"))
+            # 新结果覆盖旧结果（同名同类型）
+            merged[key] = r
+        all_results = list(merged.values())
+        # 排序：角色在前，道具在后，保持 characters.json 的顺序
+        order = [c["name"] for c in characters] + [p["name"] for p in props]
+        all_results.sort(key=lambda r: order.index(r["name"]) if r.get("name") in order else 999)
+
+        ok_all = [r for r in all_results if r.get("status") == "ok"]
         index_data = {
             "project": project,
             "style": style_key,
-            "total": total_tasks,
-            "completed": len(ok),
-            "results": results,
+            "total": len(all_results),
+            "completed": len(ok_all),
+            "results": all_results,
         }
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, ensure_ascii=False, indent=2)
-        log(f"索引文件: {index_path}")
+        log(f"索引文件: {index_path}（共 {len(all_results)} 项，成功 {len(ok_all)} 项）")
 
         # 更新 project.json
         if pm:
@@ -355,9 +395,13 @@ def main():
         log("=" * 62)
 
     finally:
-        if not args.keep_tab and tid:
+        # 只关闭本次自己新建的标签页。复用来的标签页属于用户的会话，
+        # 关掉会导致下次运行找不到可复用的页面（且丢失对话上下文）。
+        if not args.keep_tab and tid and tid == created_tid:
             page.close_tab()
             log("\n已关闭本次创建的标签页。")
+        elif tid:
+            log("\n已保留复用的豆包标签页（未关闭）。")
 
 
 if __name__ == "__main__":

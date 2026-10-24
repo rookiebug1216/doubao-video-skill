@@ -144,8 +144,9 @@ class TestSendConfirmationButtonFirst:
         """有按钮时应优先点击，不调 fill_prompt。"""
         import doubao_gen
         page = FakeCDPPage(scripts=[
-            # 第一次 eval_js 是按钮查找，返回 'button:确认生成'
-            ("querySelector", "button:确认生成"),
+            # 按钮查找 eval_js：新版返回 JSON 坐标（send_confirmation 用 CDP 真实鼠标点击）
+            ("querySelector",
+             '{"x": 100, "y": 200, "text": "确认生成", "disabled": false}'),
         ])
         # 替换 fill_prompt 检测
         fill_called = [False]
@@ -163,6 +164,12 @@ class TestSendConfirmationButtonFirst:
 
         assert result.startswith("button:"), f"应返回 button 前缀，实际 {result}"
         assert not fill_called[0], "有按钮时不应调 fill_prompt"
+        # 2026-10-24 现场修复：按钮点击必须是 CDP 真实鼠标事件
+        # （合成 hit.click() 不走 React onClick，点了没反应）
+        assert "Input.dispatchMouseEvent" in page.calls, \
+            "必须用 Input.dispatchMouseEvent 真实点击按钮"
+        assert page.calls.count("Input.dispatchMouseEvent") >= 3, \
+            "真实点击应含 mouseMoved/mousePressed/mouseReleased"
 
     def test_allow_text_false_never_sends_text(self):
         """allow_text=False 时按钮失败也应返回 'none'，绝不发文本。"""

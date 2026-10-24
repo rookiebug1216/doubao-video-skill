@@ -7,10 +7,15 @@
     截图兜底、页面按钮点击兜底（会误下豆包 PC 安装包）均已删除
   - 图片下载无 unlock 语义（无 unlock 参数）
   - CDP 响应按 requestId→URL 映射匹配，不会被无关请求的 loadingFinished 抢走
+  - 2026-10-24 缩略图事故：384x216 缩略图不得落盘为产物（分辨率守卫）
+  - 2026-10-24 image_ori 活源：_ROUTER_DATA 提取必须覆盖 image_ori（image_raw 已恒 null）
+  - 2026-10-24 视频无水印默认开启，--no-unlock 退回
 """
 import base64
 import inspect
+import json
 import os
+import struct
 import sys
 
 import pytest
@@ -214,3 +219,143 @@ class TestCdpDownloadUrlMatching:
         assert dest.read_bytes() == _mp4_bytes()
         assert page.body_requests == ["B"], f"只应取目标请求的响应体，实际 {page.body_requests}"
         assert doubao_gen._is_mp4_file(str(dest))
+
+
+# ──────────────────────────────────────────────────────────────
+# 2026-10-24 缩略图事故回归：分辨率守卫
+# ──────────────────────────────────────────────────────────────
+
+def _png_with_dims(w: int, h: int, size: int = 200 * 1024) -> bytes:
+    """构造指定宽高的 PNG 字节（签名 + IHDR + padding）。"""
+    return (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x09" + b"IHDR"
+            + struct.pack(">II", w, h) + b"\x00" * max(0, size - 24))
+
+
+class TestImageHiResGuard:
+    """断刃黄昏 shot_04/05 事故：384x216 缩略图（105KB）通过旧版体积校验
+    落盘并被误报为「无水印原图下载成功」。分辨率守卫必须拦住。"""
+
+    def test_guard_rejects_thumbnail(self, tmp_path):
+        p = tmp_path / "thumb.png"
+        p.write_bytes(_png_with_dims(384, 216))
+        assert imagegen._is_image_file(str(p)), "回归背景：旧校验确实拦不住缩略图"
+        assert not imagegen._is_image_file_hires(str(p)), "384x216 缩略图必须被守卫拦截"
+
+    def test_guard_rejects_square_icon(self, tmp_path):
+        p = tmp_path / "icon.png"
+        p.write_bytes(_png_with_dims(320, 320))
+        assert not imagegen._is_image_file_hires(str(p)), "320x320 图标必须被守卫拦截"
+
+    def test_guard_accepts_landscape_original(self, tmp_path):
+        p = tmp_path / "ori.png"
+        p.write_bytes(_png_with_dims(2720, 1520))
+        assert imagegen._is_image_file_hires(str(p))
+
+    def test_guard_accepts_portrait_original(self, tmp_path):
+        """最长边判据不歧视竖版原图（1520x2720）。"""
+        p = tmp_path / "ori_v.png"
+        p.write_bytes(_png_with_dims(1520, 2720))
+        assert imagegen._is_image_file_hires(str(p))
+
+    def test_guard_rejects_non_image(self, tmp_path):
+        p = tmp_path / "fake.png"
+        p.write_bytes(b"\x00" * 200 * 1024)
+        assert not imagegen._is_image_file_hires(str(p))
+
+    def test_img_dimensions_png(self, tmp_path):
+        p = tmp_path / "d.png"
+        p.write_bytes(_png_with_dims(2848, 1600))
+        assert imagegen._img_dimensions(str(p)) == (2848, 1600)
+
+
+class TestImageDownloadSourceLocks:
+    """源码锁：下载主流程必须全程使用分辨率守卫与 image_ori 活源。"""
+
+    def test_impl_uses_hires_guard_only(self):
+        src = inspect.getsource(imagegen._download_image_impl)
+        assert "_is_image_file_hires" in src
+        assert "_is_image_file(filepath)" not in src, \
+            "下载主流程不得再使用无分辨率守卫的旧校验"
+
+    def test_router_extracts_image_ori(self):
+        """_ROUTER_DATA 提取必须覆盖 image_ori 活源（image_raw 已恒 null）。"""
+        src = inspect.getsource(imagegen._router_ori_urls)
+        assert "image_ori" in src
+        assert "qvalue" in src, "必须排除 image-qvalue UI 图标"
+
+    def test_reload_session_uses_navigate(self):
+        """重导航必须用 Page.navigate 到原 URL（Page.reload 会丢 SPA 会话路由）。"""
+        import re as _re
+        src = inspect.getsource(imagegen._reload_session)
+        src = _re.sub(r'"""(?:.|\n)*?"""', "", src, count=1)  # 去 docstring 防误伤
+        assert "Page.navigate" in src
+        assert "Page.reload" not in src
+
+    def test_own_src_not_first_candidate(self):
+        """wait_image 返回的 src（可能是缩略图）不得排候选首位——
+        缩略图直链下载成功率最高，排首位会抢在 image_ori 之前落盘。"""
+        src = inspect.getsource(imagegen._download_image_impl)
+        first_block = src.split("# ②")[0]
+        assert "own_fid" in first_block, "候选构建必须先按文件 ID 提取 image_ori"
+        assert "candidates.append(url)" in first_block
+        assert "candidates.append(own_src)" not in first_block
+
+
+class _FakeRouterPage:
+    """fake page：只响应 _ROUTER_DATA 与页面最大图两类 eval_js。"""
+
+    def __init__(self, router_obj, largest_src=""):
+        self._router = router_obj
+        self._largest = largest_src
+
+    def eval_js(self, js, **kw):
+        if "window._ROUTER_DATA||null" in js:
+            return json.dumps(self._router) if self._router is not None else "null"
+        if "rc_gen_image" in js:
+            return self._largest
+        return None
+
+
+class TestRouterOriUrls:
+    """image_ori 提取单测（2026-10-24 实测的豆包响应形态）。"""
+
+    _ORI_URL = ("https://p6-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/"
+                "rc_gen_image/abc123def456.png~tplv-a9rns2rl98-image.png?x-signature=s1")
+
+    def test_extracts_image_ori_object_form(self):
+        """image_ori 为 {url: ...} 对象形态。"""
+        page = _FakeRouterPage(
+            {"loaderData": {"chat": {"creations": [{"image": {
+                "image_ori": {"url": self._ORI_URL},
+                "url": "https://cdn.example/thumb.jpeg~tplv-cthumb_wm0",
+            }}]}}})
+        assert imagegen._router_ori_urls(page, "abc123def456") == [self._ORI_URL]
+
+    def test_excludes_icon_and_avatar(self):
+        """同 ID 命中 qvalue 图标 / 头像路径必须排除。"""
+        page = _FakeRouterPage(
+            {"a": {"image_ori": {"url": "https://cdn.example/image-qvalue/abc123def456.png"}},
+             "b": {"image_ori": {"url": "https://cdn.example/user-avatar/abc123def456.png"}},
+             "c": {"image_ori": {"url": self._ORI_URL}}})
+        assert imagegen._router_ori_urls(page, "abc123def456") == [self._ORI_URL]
+
+    def test_no_file_id_match_returns_empty(self):
+        page = _FakeRouterPage({"a": {"image_ori": {"url": self._ORI_URL}}})
+        assert imagegen._router_ori_urls(page, "otherid99999") == []
+
+    def test_null_router_returns_empty(self):
+        assert imagegen._router_ori_urls(_FakeRouterPage(None), "abc") == []
+
+
+class TestVideoUnlockDefaultOn:
+    """2026-10-24 决策：视频无水印默认开启，--no-unlock 退回（翻转旧 opt-in）。"""
+
+    def test_no_unlock_flag_replaces_unlock(self):
+        src = _read(_DOUBAO_GEN_PATH)
+        assert '"--no-unlock"' in src
+        assert "args.no_unlock" in src
+        assert '"--unlock"' not in src, "旧 opt-in 开关 --unlock 不得回流"
+
+    def test_arm_not_gated_by_optin(self):
+        src = _read(_DOUBAO_GEN_PATH)
+        assert "if not args.no_unlock:" in src, "钩子安装必须默认执行"

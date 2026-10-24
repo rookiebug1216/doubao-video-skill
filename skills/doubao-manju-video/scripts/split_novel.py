@@ -1436,7 +1436,10 @@ def build_frame_prompt(scene: str, narration: str, characters: list,
             for i, name in enumerate(characters)
         )
     else:
-        char_list = "画面主体"
+        # 2026-10-24 现场实测：空占位"画面主体"会让豆包自行补一个人物
+        # （空巷镜生成了红衣女子，与原文"空无一人"矛盾）。改为明确空镜+排除条款。
+        char_list = ("空镜，无任何人物与生物出现，画面中只有环境与氛围；"
+                     "不要出现人脸、人体、剪影、倒影中的人")
 
     parts = [f"{style}。{ratio_desc}，定格关键帧（t=0.00s）。场景：{scene}。"]
     if entry_state:
@@ -1522,7 +1525,9 @@ def build_end_frame_prompt(scene: str, narration: str, characters: list,
             for i, name in enumerate(characters)
         )
     else:
-        char_list = "画面主体"
+        # 2026-10-24 现场实测：同 build_frame_prompt，空镜必须显式排除人物
+        char_list = ("空镜，无任何人物与生物出现，画面中只有环境与氛围；"
+                     "不要出现人脸、人体、剪影、倒影中的人")
 
     parts = [f"{style}。{ratio_desc}，尾帧定格画面（t=结束）。场景：{scene}。"]
     parts.append(f"主体：{char_list}。")

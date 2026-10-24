@@ -160,7 +160,7 @@ def test_image_resolution_baseline(first_result):
 
 def test_router_data_raw_path_logged(gen_result):
     """
-    图片默认优先走 `_ROUTER_DATA` 的 image_raw 无水印原图（无 unlock 开关）。
+    图片默认优先走 `_ROUTER_DATA` 的 image_ori 无水印原图（无 unlock 开关）。
 
     CLI 日志必须含 _ROUTER_DATA 链路或「无水印原图下载成功」字样，
     验证走了首选无水印原图链路，而非降级到带水印页面资源。

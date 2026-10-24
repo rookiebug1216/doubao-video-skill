@@ -79,6 +79,9 @@ class _UploadPage:
         return self.inject_ok
 
     def eval_js(self, js, await_promise=False, recv_timeout=120):
+        # _wait_file_input_ready 的探测 JS（含 NO_INPUT 标记）→ 输入框已就绪
+        if "NO_INPUT" in js:
+            return json.dumps({"count": 1, "visible": 1, "hasAccept": True})
         if not self.states:
             return json.dumps({"ready": 0, "uploading": False, "failed": False})
         st = self.states.pop(0) if len(self.states) > 1 else self.states[0]

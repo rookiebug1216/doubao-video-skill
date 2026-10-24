@@ -97,11 +97,15 @@ def test_end_frame_prompt_with_composition_fields():
 
 
 def test_end_frame_prompt_no_characters():
+    """无角色镜头必须输出明确空镜措辞（2026-10-24 bug12：'主体：画面主体'
+    空占位会让豆包自行补人物，实测镜01 空巷生成了红衣女子）。"""
     p = build_end_frame_prompt(
         scene="空荡的大殿", narration="寂静无声。", characters=[],
         exit_state="空无一人", style="CG写实3D", ratio_desc="9:16竖屏",
     )
-    assert "画面主体" in p
+    assert "画面主体" not in p, "不得再输出'画面主体'空占位"
+    assert "空镜" in p and "无任何人物" in p
+    assert "不要出现人脸" in p
 
 
 # ── _last_clause_quote_aware ──

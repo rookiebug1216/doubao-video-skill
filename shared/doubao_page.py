@@ -40,7 +40,11 @@ def page_ready(page: CDPPage, timeout: int = 60) -> bool:
 LOGIN_STATE_JS = """
 (()=>{
   const body=document.body.innerText||'';
-  const inputs=document.querySelectorAll('textarea,[contenteditable="true"]').length;
+  // 2026-10-24：新版豆包编辑器是 ProseMirror，contenteditable 值为
+  // "plaintext-only"（不是 "true"），与 fill_prompt 的选择器保持一致，
+  // 否则已登录页面 inputs=0 被误判为未登录。
+  const inputs=document.querySelectorAll(
+    'textarea,[contenteditable="true"],[contenteditable="plaintext-only"],.ProseMirror').length;
   const loginBtn=[...document.querySelectorAll('button,a,[role=button]')].some(e=>{
     if(e.offsetParent===null) return false;
     const t=(e.innerText||'').trim();
@@ -61,10 +65,30 @@ def login_state(page: CDPPage) -> dict:
         return {"inputs": 0, "loginBtn": False, "wall": False}
 
 
-def is_logged_in(page: CDPPage) -> bool:
-    """判断当前页面是否已登录豆包。"""
+def is_logged_in(page: CDPPage, settle_s: int = 10) -> bool:
+    """判断当前页面是否已登录豆包。
+
+    2026-10-24 修复：page_ready 返回就绪时 ProseMirror 编辑器可能尚未挂载
+    （React 水合中），一次性评估 inputs=0 会把已登录页面误判为未登录
+    （chrome-profile 实测：Cookie 含 d_ticket/sessionid、编辑器已可见，
+    probe 却报「未登录」，两次复现）。
+    无登录墙信号但编辑器未挂载时，等水合稳定（最多 settle_s 秒）再下结论。
+    """
     st = login_state(page)
-    return st["inputs"] > 0 and not st["loginBtn"] and not st["wall"]
+    if st["loginBtn"] or st["wall"]:
+        return False
+    if st["inputs"] > 0:
+        return True
+    # 灰区：无登录墙但编辑器未挂载 —— 等待水合完成
+    deadline = time.time() + settle_s
+    while time.time() < deadline:
+        time.sleep(1.5)
+        st = login_state(page)
+        if st["loginBtn"] or st["wall"]:
+            return False
+        if st["inputs"] > 0:
+            return True
+    return False
 
 
 def wait_login(page: CDPPage, timeout_s: int, outdir: str, screenshot_tag: str) -> bool:
@@ -100,63 +124,134 @@ def wait_login(page: CDPPage, timeout_s: int, outdir: str, screenshot_tag: str) 
 
 def fill_prompt(page: CDPPage, text: str) -> bool:
     """
-    把提示词填入输入框。
+    把提示词填入豆包输入框。
 
-    覆盖三类载体：textarea / input / contenteditable（富文本）。
-    - 表单控件：原生 setter 赋值触发 React 受控更新，再派发 input 事件
-    - contenteditable：execCommand insertText（等价真实键入，React 一定收到）
+    2026-10-24 实测（豆包新版 ProseMirror 编辑器）——四种方式全试过：
+
+      A. execCommand('insertText')  ✅ 有效
+         DOM 有文本 + 豆包 React 状态同步更新 → 合成 Enter 可提交。
+      B. Input.insertText            ❌ 无效
+         文本写进 DOM，但 React 状态未更新（按钮仍禁用/点击无反应），
+         提交永远发不出去。看似"填入成功"，实则只是改了 DOM。
+      C. Input.dispatchKeyEvent 逐字   ❌ 中文打不进去
+      D. 点击发送按钮                  ❌ 右下角被「豆包助手 浏览器插件」
+         启动器浮层完全覆盖（启动器 126x46 @1311,715 与按钮同位），
+         点击落到浮层上，页面毫无反应。
+
+    因此采用 A 填入 + 合成 Enter 提交（见 submit_prompt）。
     """
     payload = json.dumps(text, ensure_ascii=False)
     js = f"""
     (()=>{{
       const text = {payload};
-      const sel = 'textarea, input[type=text], [contenteditable="true"], [contenteditable=""]';
-      const candidates = [...document.querySelectorAll(sel)]
-        .filter(e => e.offsetParent !== null || e.getClientRects().length);
-      if (!candidates.length) return null;
+      const vis = e => (e.offsetParent !== null || e.getClientRects().length > 0);
+      const all = [...document.querySelectorAll(
+        '.ProseMirror, [contenteditable="true"], [contenteditable="plaintext-only"], '
+        + 'textarea, input[type=text]')].filter(vis);
+      if (!all.length) return null;
 
-      candidates.sort((a,b)=>{{
-        const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect();
-        return (rb.width*rb.height)-(ra.width*ra.height);
-      }});
-      const el = candidates[0];
-      const isEditable = el.tagName==='TEXTAREA' || el.tagName==='INPUT';
+      // 优先 ProseMirror / contenteditable（豆包真正的编辑器）
+      const score = e => {{
+        const cls = (e.className && e.className.toString()) || '';
+        if (cls.includes('ProseMirror') || cls.includes('tiptap')) return 0;
+        if (e.getAttribute && e.getAttribute('contenteditable') !== null
+            && e.getAttribute('contenteditable') !== 'false') return 1;
+        return 2;
+      }};
+      all.sort((a,b)=>score(a)-score(b));
+      const el = all[0];
 
-      if (isEditable) {{
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (setter && setter.set) setter.set.call(el, text);
-        else el.value = text;
-        el.dispatchEvent(new Event('input', {{bubbles:true}}));
-        el.dispatchEvent(new Event('change', {{bubbles:true}}));
-      }} else {{
-        el.focus();
-        document.execCommand('selectAll', false, null);
-        document.execCommand('insertText', false, text);
-      }}
       el.focus();
-      return {{tag: el.tagName, len: (el.value!==undefined?el.value:el.innerText||'').length}};
+      // 先清空既有内容，避免与残留文本拼接
+      try {{
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand('delete', false, null);
+      }} catch(e) {{}}
+      el.focus();
+      document.execCommand('insertText', false, text);
+      el.focus();
+      const len = (el.innerText || el.textContent || el.value || '').trim().length;
+      return {{tag: el.tagName, cls: (el.className&&el.className.toString())||'', len}};
     }})()
     """
     try:
         res = page.eval_js(js)
-        return res is not None
+        if res is None:
+            log("  ! 未找到可见的输入框")
+            return False
+        got = res.get("len", 0) if isinstance(res, dict) else 0
+        if got <= 0:
+            log("  ! 填入后回读长度为 0")
+            return False
+        return True
     except CDPError as e:
         log(f"  ! 填入提示词失败: {e}")
         return False
 
 
+def _close_asset_panel(page: CDPPage) -> bool:
+    """
+    关闭豆包网页版的「素材工作台」右侧面板。
+
+    2026-10-24 实测：该面板会覆盖输入区右下角，把发送按钮完全遮住 ——
+    脚本按坐标点击时落在面板的「全选/打码下载」上，提示词永远发不出去
+    （表现为"已点击发送按钮"但页面毫无反应）。
+    关闭按钮：<button class="dba-icon-btn">关闭</button>（位于面板标题栏右侧）。
+    """
+    js = r"""
+    (()=>{
+      const btns=[...document.querySelectorAll('button.dba-icon-btn, button[class*=dba-icon-btn]')];
+      const hit=btns.find(b=>((b.innerText||'')+(b.getAttribute('aria-label')||'')+(b.getAttribute('title')||'')).trim().indexOf('关闭')>=0);
+      if(!hit) return null;
+      const r=hit.getBoundingClientRect();
+      if(r.width<6||r.height<6) return null;
+      return JSON.stringify({x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
+    })()
+    """
+    try:
+        loc = page.eval_js(js)
+        if not loc:
+            return False
+        loc = json.loads(loc) if isinstance(loc, str) else loc
+        for evt in ("mousePressed", "mouseReleased"):
+            page.call("Input.dispatchMouseEvent", recv_timeout=15, type=evt,
+                      x=loc["x"], y=loc["y"], button="left", clickCount=1)
+        time.sleep(1.2)
+        log("  · 已关闭「素材工作台」侧面板（它会遮挡发送按钮）")
+        return True
+    except CDPError:
+        return False
+
+
 def submit_prompt(page: CDPPage) -> bool:
     """
-    提交提示词：Enter 键优先（真实用户行为，兼容性最好），
-    失败回退到「发送」按钮点击。
+    提交提示词。
+
+    2026-10-24 实测（豆包新版 ProseMirror）——有效路径只有一条：
+
+      ✅ 合成 KeyboardEvent('Enter')（dispatchEvent）
+         前提：内容是用 execCommand('insertText') 填入的（会同步 React 状态）。
+         提交后豆包新建会话（URL 变为 /chat/<id>），编辑器清空。
+
+      ❌ CDP Input.dispatchKeyEvent 的 Enter —— 页面无反应
+      ❌ 点击发送按钮 —— 右下角被「豆包助手 浏览器插件」启动器浮层
+         （126x46 @1311,715，与 send-btn-wrapper 完全同位）覆盖，
+         点击落在浮层上，页面毫无反应。
+
+    合成 Enter 失败时，回退到点击（并先隐藏遮挡浮层）。
     """
+    # ── 主路径：合成 Enter ──
     js_enter = """
     (()=>{
-      const sel='textarea,input[type=text],[contenteditable="true"]';
-      const els=[...document.querySelectorAll(sel)].filter(e=>e.offsetParent!==null);
+      const sel='.ProseMirror, textarea, input[type=text], [contenteditable="true"]';
+      const els=[...document.querySelectorAll(sel)]
+        .filter(e=>e.offsetParent!==null || e.getClientRects().length);
       if(!els.length) return null;
-      const el=els[els.length-1];
+      const el=els[0];
       el.focus();
       const opts={bubbles:true,cancelable:true,key:'Enter',code:'Enter',
                   keyCode:13,which:13,shiftKey:false};
@@ -168,26 +263,122 @@ def submit_prompt(page: CDPPage) -> bool:
     """
     try:
         if page.eval_js(js_enter):
-            time.sleep(2)
-            return True
+            time.sleep(2.5)
+            st = page.eval_js("""
+            (()=>{
+              const e=document.querySelector('.ProseMirror');
+              const ed = e ? ((e.innerText||e.textContent||'').trim()) : '';
+              const t=document.body.innerText||'';
+              return JSON.stringify({empty: ed.length===0,
+                gen:/生成中|正在生成|创作中|绘制中|绘画中|思考中|正在处理/.test(t),
+                len: ed.length, url: location.href});
+            })()
+            """)
+            info = json.loads(st) if isinstance(st, str) else {}
+            if info.get("empty") or info.get("gen"):
+                return True
+            log("  · 合成 Enter 后页面未响应，改用点击发送按钮")
     except CDPError:
         pass
 
+    # ── 备选路径：点击发送按钮（先隐藏遮挡浮层与侧面板）──
+    _close_asset_panel(page)
+    _hide_launcher(page)
     js_btn = """
     (()=>{
+      const wrap=document.querySelector('[class*=send-btn-wrapper]');
       const kws=['发送','提交','生成'];
-      const btns=[...document.querySelectorAll('button,[role=button]')]
-        .filter(b=>b.offsetParent!==null && !b.disabled);
-      const hit=btns.find(b=>{
-        const t=(b.innerText||b.getAttribute('aria-label')||'').trim();
-        return t && kws.some(k=>t.includes(k));
-      });
-      if(hit){hit.click();return 'button:'+(hit.innerText||'').trim();}
-      return null;
+      let hit=null, how='';
+      if(wrap){
+        const svg=wrap.querySelector('svg');
+        hit=svg||wrap.querySelector('button')||wrap;
+        how='send-btn-wrapper';
+      }
+      if(!hit){
+        const btns=[...document.querySelectorAll('button,[role=button]')]
+          .filter(b=>(b.offsetParent!==null||b.getClientRects().length)
+                   && !b.disabled && b.getAttribute('aria-disabled')!=='true');
+        hit=btns.find(b=>{
+          const t=((b.innerText||'')+' '+(b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')).trim();
+          return t && kws.some(k=>t.includes(k));
+        });
+        if(hit) how='text';
+      }
+      if(!hit) return null;
+      const r=hit.getBoundingClientRect();
+      if(r.width<4||r.height<4) return null;
+      return JSON.stringify({how, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2),
+        disabled: !!(hit.disabled || hit.getAttribute('aria-disabled')==='true')});
     })()
     """
     try:
-        return bool(page.eval_js(js_btn))
+        for attempt in range(3):
+            loc = page.eval_js(js_btn)
+            if not loc:
+                break
+            loc = json.loads(loc) if isinstance(loc, str) else loc
+            if loc.get("disabled"):
+                time.sleep(1.0)
+                continue
+            for evt in ("mouseMoved", "mousePressed", "mouseReleased"):
+                page.call("Input.dispatchMouseEvent", recv_timeout=15,
+                          type=evt, x=loc["x"], y=loc["y"],
+                          button="left", clickCount=1)
+            time.sleep(2.5)
+            st = page.eval_js("""
+            (()=>{
+              const e=document.querySelector('.ProseMirror');
+              const ed = e ? ((e.innerText||e.textContent||'').trim()) : '';
+              const t=document.body.innerText||'';
+              return JSON.stringify({empty: ed.length===0,
+                gen:/生成中|正在生成|创作中|绘制中|绘画中|思考中|正在处理/.test(t),
+                len: ed.length});
+            })()
+            """)
+            info = json.loads(st) if isinstance(st, str) else {}
+            if info.get("empty") or info.get("gen"):
+                return True
+            log(f"  · 点击已发送但页面未响应，重试 ({attempt+1}/3)")
+            time.sleep(1.5)
+        return True
+    except CDPError:
+        return False
+
+
+def _hide_launcher(page: CDPPage) -> bool:
+    """
+    隐藏右下角「豆包助手 浏览器插件」启动器浮层。
+
+    2026-10-24 实测：该浮层（126x46 @1311,715）与豆包自己的发送按钮
+    `[class*=send-btn-wrapper]`（36x36 @1322,721）位置完全重叠，
+    elementFromPoint 命中的是浮层而非按钮，点击必然无效。
+    隐藏后按钮才可被点击。
+    """
+    js = r"""
+    (()=>{
+      let n=0;
+      document.querySelectorAll('button,div,span,a').forEach(e=>{
+        const t=(e.innerText||'').trim();
+        if(t.indexOf('浏览器插件')>=0 && t.length<30){
+          let el=e, best=e;
+          for(let i=0;i<4 && el;i++){
+            const c=(e.className||'').toString();
+            if(/launcher|dba-/.test(c) || getComputedStyle(el).cursor==='pointer'){ best=el; break; }
+            el=el.parentElement;
+          }
+          best.style.setProperty('display','none','important');
+          n++;
+        }
+      });
+      return n;
+    })()
+    """
+    try:
+        n = page.eval_js(js)
+        if n:
+            time.sleep(0.5)
+            log("  · 已隐藏「豆包助手」启动器浮层（它覆盖发送按钮）")
+        return bool(n)
     except CDPError:
         return False
 
@@ -224,6 +415,41 @@ def read_upload_state(page: CDPPage) -> dict:
         return {"ready": 0, "uploading": False, "failed": False}
 
 
+def _wait_file_input_ready(page: CDPPage, timeout: int = 30) -> bool:
+    """
+    等待豆包页面的隐藏 file input 就绪。
+
+    2026-10-24 实测：new_conversation() 导航到 /chat/ 后，React 仍在水合，
+    此时 input[type=file] 可能尚未挂载，DOM.setFileInputFiles 会静默失败
+    （files 仍为 0），上层只能看到"上传超时 0/N"。
+
+    判定：存在 input[type=file] 且它挂在可见 DOM 中（offsetParent 非 null
+    或有 client rects）—— 全 hidden 的 input 通常是模板残留，不是真正的入口。
+    """
+    js = """
+    (()=>{
+      const ins=[...document.querySelectorAll('input[type="file"]')];
+      if(!ins.length) return 'NO_INPUT';
+      const vis=ins.filter(i=>i.offsetParent!==null || i.getClientRects().length>0);
+      const usable=vis.length?vis:ins;
+      return JSON.stringify({count:ins.length, visible:vis.length,
+        hasAccept: usable.some(i=>i.accept && i.accept.includes('image'))});
+    })()
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = page.eval_js(js)
+            if isinstance(raw, str):
+                info = json.loads(raw)
+                if info.get("count", 0) > 0:
+                    return True
+        except (CDPError, json.JSONDecodeError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def upload_images(page: CDPPage, filepaths: list, timeout: int = 90,
                   retries: int = 2, log_prefix: str = "参考图") -> bool:
     """上传本地图片到豆包对话框，并确认每张图都已变成可提交的缩略图。
@@ -244,6 +470,15 @@ def upload_images(page: CDPPage, filepaths: list, timeout: int = 90,
     base_ready = read_upload_state(page).get("ready", 0)
 
     for attempt in range(1, retries + 2):
+        # 2026-10-24：new_conversation 导航后 React 仍在水合，
+        # 此时 input[type=file] 可能尚未挂载或指向错误的 input，
+        # setFileInputFiles 会静默失败（files 仍为 0）→ 表现为"上传超时 0/N"。
+        # 先等 file input 真正就绪再注入。
+        if not _wait_file_input_ready(page, timeout=30):
+            log(f"  ! {log_prefix}注入未生效（第 {attempt} 次：文件输入框未就绪）")
+            time.sleep(2)
+            continue
+
         if not page.set_file_input(paths):
             log(f"  ! {log_prefix}注入未生效（第 {attempt} 次，文件未被浏览器接收）")
             time.sleep(2)
@@ -280,11 +515,28 @@ def new_conversation(page: CDPPage, timeout: int = 60) -> bool:
 
     修复：从第 2 镜起，提交前先 navigate 到 /chat/ 触发新建对话，让豆包
     在干净上下文中走完整的参数确认卡流程。
+
+    2026-10-24 追加：导航后 ProseMirror 编辑器会比输入框更晚渲染，
+    page_ready 只探测 textarea/input 数量，会过早返回"就绪"，
+    随后 fill_prompt 找不到编辑器而报 fill_fail。故此处额外等待编辑器就绪。
     """
     try:
         page.call("Page.navigate", recv_timeout=30, url="https://www.doubao.com/chat/")
         # 等 SPA 渲染出输入框
-        return page_ready(page, timeout=timeout)
+        if not page_ready(page, timeout=timeout):
+            return False
+        # 等 ProseMirror 编辑器挂载（豆包新版富文本输入区）
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                ok = page.eval_js(
+                    "(!!document.querySelector('.ProseMirror, [contenteditable=\"true\"]'))")
+                if ok:
+                    return True
+            except CDPError:
+                pass
+            time.sleep(1)
+        return True   # 编辑器未挂载但页面已就绪，交由 fill_prompt 报错
     except CDPError as e:
         log(f"  ! 新建对话失败: {e}")
         return False

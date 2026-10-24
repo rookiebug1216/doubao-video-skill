@@ -68,7 +68,15 @@ def quota_exhausted(page: CDPPage) -> bool:
 
 
 def _collect_img_srcs(page: CDPPage) -> set:
-    """收集页面所有 <img> 的 src（用于基线对比）。过滤掉 UI 图标、头像和小图片。"""
+    """收集页面所有 <img> 的 src（用于基线对比）。过滤掉 UI 图标、头像和小图片。
+
+    2026-10-24 实测：豆包新版的生成图 URL 形如
+      https://p6-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/rc_gen_image/<id>.jpeg~tplv-...
+    且页面同时存在 384x216 的缩略图与 2848x1600 的原图两个 <img>。
+    原来的「宽或高 < 200 即过滤」会把 384x216 的缩略图整体滤掉，
+    导致基线对比拿不到任何新图（wait_image 永远超时）。
+    故阈值下调到 120，并排除 data: 内联占位符。
+    """
     try:
         raw = page.eval_js(r"""
         JSON.stringify([...document.querySelectorAll('img')]
@@ -80,14 +88,14 @@ def _collect_img_srcs(page: CDPPage) -> set:
             if(sl.includes('avatar')||sl.includes('/icon/')||sl.includes('/logo/')||sl.includes('sprite')) return false;
             // 过滤用户头像域名
             if(sl.includes('byteacctimg.com')||sl.includes('passport')) return false;
-            // 过滤小尺寸图片
+            // 过滤小尺寸图片（阈值 120：豆包缩略图 384x216 需保留）
             const w=img.naturalWidth||img.width||0;
             const h=img.naturalHeight||img.height||0;
-            if(w>0 && w<200) return false;
-            if(h>0 && h<200) return false;
+            if(w>0 && w<120) return false;
+            if(h>0 && h<120) return false;
             return true;
           })
-          .map(img=>(img.currentSrc||img.src||'').slice(0,200)))
+          .map(img=>(img.currentSrc||img.src||'')))
         """)
         return set(json.loads(raw)) if isinstance(raw, str) else set()
     except CDPError:
@@ -143,16 +151,23 @@ def wait_image(page: CDPPage, baseline_srcs: set, timeout: int = RENDER_TIMEOUT)
                     # spinner 刚消失，检查图片是否已完全加载
                     current_srcs = _collect_img_srcs(page)
                     fresh = current_srcs - baseline_srcs
-                    if fresh:
+                    # 2026-10-24 实测：新会话页会同时加载豆包的静态装饰图
+                    # （lf-flow-web-cdn.doubao.com/.../static/image/intro...），
+                    # 它同样是"新出现"的，会被误判成生成图（实测下到了欢迎页插画）。
+                    # 生成图的 URL 必含 rc_gen_image —— 据此过滤。
+                    gen_fresh = [s for s in fresh if "rc_gen_image" in s]
+                    if not gen_fresh:
+                        gen_fresh = []
+                    if gen_fresh:
                         # 检查图片是否已完全加载
                         loaded_js = f"""
                         (()=>{{
-                          const srcs={json.dumps(list(fresh))};
+                          const srcs={json.dumps(list(gen_fresh))};
                           for(const s of srcs){{
                             const img=[...document.querySelectorAll('img')]
-                              .find(i=>{{const si=(i.currentSrc||i.src||''); return si.startsWith(s)||s.startsWith(si.slice(0,200));}});
+                              .find(i=>{{const si=(i.currentSrc||i.src||''); return si===s||si.startsWith(s)||s.startsWith(si);}});
                             if(img && img.complete && img.naturalWidth > 200){{
-                              return JSON.stringify({{src: (img.currentSrc||img.src||'').slice(0,200),
+                              return JSON.stringify({{src: (img.currentSrc||img.src||''),
                                 w: img.naturalWidth, h: img.naturalHeight}});
                             }}
                           }}
@@ -181,36 +196,79 @@ def wait_image(page: CDPPage, baseline_srcs: set, timeout: int = RENDER_TIMEOUT)
     return None, None
 
 
-def _router_raw_image_urls(page: CDPPage) -> list:
-    """从页面首屏 window._ROUTER_DATA 提取当前生成图的 image_raw 无水印签名 URL 列表。
+def _router_ori_urls(page: CDPPage, file_id: str = "") -> list:
+    """从页面首屏 window._ROUTER_DATA 提取当前生成图的无水印原图签名 URL 列表。
 
-    原理：豆包 SPA 首屏数据中存有服务端签好的 image_raw URL（x-signature 现成，
-    x-expires 至 2036 年），无需额外签名构造。按页面上当前最大生成图的 URI id
-    精确匹配，避免多图会话中串图；刚生成、尚未写入首屏数据的图返回空（自动降级）。
+    2026-10-24 实测（豆包服务端变更后）：
+      * 旧数据源 image_raw 已恒为 null，保留提取仅作兼容
+      * 活源是 creations[].image.image_ori 字段的 url ——
+        ~tplv-a9rns2rl98-image.png 变体即无水印原图（2720x1520 级），
+        与 cgen_lwm3（带水印）/ cthumb_wm0（缩略图）共用同一 32-hex 文件 ID
+      * _ROUTER_DATA 中混有 UI 图标（image-qvalue 320x320）、用户头像等，
+        必须按文件 ID 精确匹配 + 排除非生成图路径，否则会下载到图标
 
-    注意：同 id 条目中会混入视频（ftyp 头）——调用方须按文件头逐条校验。
+    file_id: 优先传本镜 wait_image 返回 src 中的 rc_gen_image/<id>；
+             为空时回落到页面当前最大生成图的 ID（多图会话可能串图）。
+    刚生成、尚未写入首屏数据的图返回空（调用方重导航后重试）。
     """
     try:
-        cur_src = page.eval_js(r"""
-        (()=>{
-          const imgs=[...document.querySelectorAll('img')]
-            .filter(img=>img.offsetParent!==null && (img.currentSrc||img.src||'').includes('rc_gen_image') && img.naturalWidth>100);
-          if(!imgs.length) return '';
-          imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
-          return (imgs[0].currentSrc||imgs[0].src||'');
-        })()
-        """) or ""
-        m = re.search(r"rc_gen_image/([0-9a-zA-Z]+)", cur_src)
-        if not m:
-            return []
+        if not file_id:
+            cur_src = page.eval_js(r"""
+            (()=>{
+              const imgs=[...document.querySelectorAll('img')]
+                .filter(img=>img.offsetParent!==null && (img.currentSrc||img.src||'').includes('rc_gen_image') && img.naturalWidth>100);
+              if(!imgs.length) return '';
+              imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
+              return (imgs[0].currentSrc||imgs[0].src||'');
+            })()
+            """) or ""
+            m = re.search(r"rc_gen_image/([0-9a-zA-Z]+)", cur_src)
+            if not m:
+                return []
+            file_id = m.group(1)
         rd = page.eval_js("JSON.stringify(window._ROUTER_DATA||null)")
         if not rd or rd == "null":
             return []
         clean = rd.replace("\\u002F", "/").replace("\\/", "/")
-        return [u for u in re.findall(r"https?://[^\"'\s\\<>]+image_raw[^\"'\s\\<>]*", clean)
-                if m.group(1) in u]
+        urls = []
+        # image_ori: {"url": "..."} 或直接字符串（无水印原图，当前活源）
+        urls += re.findall(r'"image_ori"\s*:\s*\{[^{}]*?"url"\s*:\s*"([^"]+)"', clean)
+        urls += re.findall(r'"image_ori"\s*:\s*"([^"]+)"', clean)
+        urls += re.findall(r'"image_ori_raw"\s*:\s*"([^"]+)"', clean)
+        # image_raw: 旧数据源（服务端变更后恒 null，保留兼容）
+        urls += re.findall(r"https?://[^\"'\s\\<>]+image_raw[^\"'\s\\<>]*", clean)
+        return [u for u in urls
+                if file_id in u
+                and not re.search(r"qvalue|user-avatar|BIZ_BOT_ICON|ocean-cloud-tos|byteacctimg", u)]
     except (CDPError, json.JSONDecodeError):
         return []
+
+
+def _reload_session(page: CDPPage, wait_s: int = 20) -> bool:
+    """重导航当前会话页，让服务端首屏 _ROUTER_DATA 收录刚生成的图。
+
+    2026-10-24 实测：刚生成的图不在当前 _ROUTER_DATA（首屏数据在页面加载时
+    由服务端注入），需重导航一次让新图进入首屏数据。
+    注意：
+      * SPA 会话路由在 Page.reload 后会退回 /chat，故用 Page.navigate 到原 URL
+      * 导航会重置页面 JS 状态（fetch 钩子、捕获缓存），调用方须先取走捕获结果
+    """
+    try:
+        url = page.eval_js("location.href")
+        if not url or not str(url).startswith("http"):
+            return False
+        page.call("Page.navigate", recv_timeout=60, url=url)
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                if page.eval_js("JSON.stringify(window._ROUTER_DATA!=null)") == "true":
+                    return True
+            except CDPError:
+                pass
+        return False
+    except Exception:
+        return False
 
 
 def _direct_download_image(page: CDPPage, url: str, filepath: str) -> bool:
@@ -231,7 +289,7 @@ def _direct_download_image(page: CDPPage, url: str, filepath: str) -> bool:
     except Exception as e:
         log(f"  · 直链下载失败: {e}")
         return False
-    if len(data) < 100 * 1024:
+    if len(data) < 20 * 1024:
         log(f"  · 直链下载文件太小({len(data) // 1024}KB)")
         return False
     if data[:8] != b"\x89PNG\r\n\x1a\n" and data[:3] != b"\xff\xd8\xff":
@@ -242,8 +300,8 @@ def _direct_download_image(page: CDPPage, url: str, filepath: str) -> bool:
     return True
 
 
-def _img_is_portrait(filepath: str) -> bool | None:
-    """读取图片宽高，判断是否竖版。无法解析返回 None。"""
+def _img_dimensions(filepath: str):
+    """读取 PNG/JPEG 宽高，返回 (w, h)。无法解析返回 None。"""
     try:
         with open(filepath, "rb") as f:
             head = f.read(32)
@@ -253,7 +311,7 @@ def _img_is_portrait(filepath: str) -> bool | None:
             with open(filepath, "rb") as f:
                 f.seek(16)
                 w, h = struct.unpack(">II", f.read(8))
-            return h > w
+            return w, h
         # JPEG: 扫 SOF0/2 段
         if head[:2] == b"\xff\xd8":
             import struct
@@ -269,7 +327,7 @@ def _img_is_portrait(filepath: str) -> bool | None:
                     if marker in (b"\xc0", b"\xc1", b"\xc2"):
                         f.read(3)
                         h, w = struct.unpack(">HH", f.read(4))
-                        return h > w
+                        return w, h
                     if marker in (b"\xd8", b"\xd9") or b"\xd0" <= marker <= b"\xd7":
                         continue
                     seg_len = struct.unpack(">H", f.read(2))[0]
@@ -277,6 +335,12 @@ def _img_is_portrait(filepath: str) -> bool | None:
     except Exception:
         return None
     return None
+
+
+def _img_is_portrait(filepath: str) -> bool | None:
+    """判断图片是否竖版。无法解析返回 None。"""
+    dims = _img_dimensions(filepath)
+    return None if dims is None else dims[1] > dims[0]
 
 
 def _ratio_mismatch(filepath: str, expect_portrait: bool | None) -> bool:
@@ -290,13 +354,36 @@ def _ratio_mismatch(filepath: str, expect_portrait: bool | None) -> bool:
 
 
 def _is_image_file(filepath: str) -> bool:
-    """校验落盘文件确为图片：PNG/JPEG 文件头 + 体积阈值（>100KB）。"""
+    """校验落盘文件确为图片：PNG/JPEG 文件头 + 体积阈值（>20KB）。
+
+    注意：该校验不拦缩略图（384x216 缩略图约 105KB 也能通过）。
+    下载链路统一用 _is_image_file_hires（含分辨率守卫），本函数仅供诊断。
+    """
     try:
-        if not os.path.isfile(filepath) or os.path.getsize(filepath) <= 100 * 1024:
+        if not os.path.isfile(filepath) or os.path.getsize(filepath) <= 20 * 1024:
             return False
         with open(filepath, "rb") as f:
             head = f.read(8)
         return head == b"\x89PNG\r\n\x1a\n" or head[:3] == b"\xff\xd8\xff"
+    except OSError:
+        return False
+
+
+def _is_image_file_hires(filepath: str, min_side: int = 1280) -> bool:
+    """校验落盘文件为 PNG/JPEG 且分辨率达标（最长边 >= min_side）。
+
+    2026-10-24 缩略图事故（断刃黄昏 shot_04/05 尾帧实锤）：384x216 缩略图
+    （105KB）通过了旧版 20KB 体积校验落盘，并被误报为"无水印原图下载成功"，
+    导致后续视频参考图模糊。豆包生成原图最长边 >=1520（2720x1520 /
+    1520x2720 / 2848x1600），缩略图最长边 384，取 1280 可精确区分两者。
+    """
+    try:
+        if not os.path.isfile(filepath) or os.path.getsize(filepath) <= 20 * 1024:
+            return False
+        dims = _img_dimensions(filepath)
+        if dims is None:
+            return False
+        return max(dims) >= min_side
     except OSError:
         return False
 
@@ -322,20 +409,28 @@ def _candidate_url(item) -> str:
 
 
 def _largest_gen_image_src(page: CDPPage) -> str:
-    """页面中面积最大的 rc_gen_image 图片 src（带水印页面资源）。"""
+    """页面中面积最大的 rc_gen_image 图片 src（带水印页面资源）。
+
+    2026-10-24 实测：豆包同时渲染两个 <img> —— 384x216 的缩略图与
+    2848x1600 的原图。必须按 naturalWidth*naturalHeight 选最大者，
+    否则只会拿到缩略图。原图的 offsetParent 可能为 null（虚拟列表/懒加载），
+    故不用 offsetParent 过滤，只排除 data: 内联占位符。
+    """
     try:
         found = page.eval_js(r"""
         (()=>{
           const imgs=[...document.querySelectorAll('img')]
             .filter(img=>{
-              if(img.offsetParent===null) return false;
               const s=(img.currentSrc||img.src||'');
-              if(!s || !s.includes('rc_gen_image')) return false;
+              if(!s || s.startsWith('data:')) return false;
+              if(!s.includes('rc_gen_image')) return false;
+              // 排除豆包站点自身的静态资源（欢迎页装饰图等）
+              if(s.includes('lf-flow-web-cdn.doubao.com')) return false;
               return img.naturalWidth>100;
             });
           if(!imgs.length) return null;
           imgs.sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
-          return (imgs[0].currentSrc||imgs[0].src||'').slice(0,500);
+          return (imgs[0].currentSrc||imgs[0].src||'');
         })()
         """)
         return found or ""
@@ -375,24 +470,41 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
                          img_info: dict | None = None) -> str | None:
     """
     下载图片（双档，不做截图、不点击页面按钮）：
-      1) 无水印原图（始终优先）：_ROUTER_DATA 的 image_raw URL + fetch 钩子捕获的
-         原图 URL，先用 Python 直链，失败再走页面 fetch，保证人物原始分辨率
+      1) 无水印原图（始终优先）：_ROUTER_DATA 的 image_ori 签名直链（按本镜
+         文件 ID 匹配，排除 UI 图标）+ fetch 钩子捕获的原图 URL；首轮未命中时
+         重导航会话页让首屏数据收录新图后再试一轮。先 Python 直链，失败再页面 fetch
       2) 带水印（兜底）：页面尺寸最大的 rc_gen_image，依次尝试 Python 直链 /
          页面 fetch / download_native / download_raw
 
-    每个方案落盘后用 _is_image_file 校验，不通过即删除并继续下一方案。
-    img_info: wait_image() 返回的 {"src": ...}，优先使用该 src 而非重新搜索。
+    每个方案落盘后用 _is_image_file_hires 校验（PNG/JPEG 头 + 最长边 >=1280，
+    拦截 384x216 缩略图），不通过即删除并继续下一候选。
+    img_info: wait_image() 返回的 {"src": ...}，用于提取本镜文件 ID 与兜底 src。
     """
     os.makedirs(outdir, exist_ok=True)
     filepath = os.path.join(outdir, f"{name}_{tag}.png")
 
-    # ── 第一档：无水印原图（始终优先）──
-    try:
-        router_urls = _router_raw_image_urls(page)
-    except CDPError as e:
-        log(f"  · _ROUTER_DATA 读取异常: {e}")
-        router_urls = []
+    own_src = (img_info or {}).get("src") or ""
+    fid_m = re.search(r"rc_gen_image/([0-9a-zA-Z]+)", own_src)
+    own_fid = fid_m.group(1) if fid_m else ""
 
+    def _try_download(url: str) -> bool:
+        """单候选两路下载 + 分辨率守卫，成功时文件已落盘。"""
+        if _direct_download_image(page, url, filepath) and _is_image_file_hires(filepath):
+            log(f"  · 无水印原图下载成功（直链），{os.path.getsize(filepath) // 1024} KB")
+            return True
+        _discard_file(filepath)
+        try:
+            fetched = page.download_via_fetch(url, filepath, timeout=30)
+        except CDPError:
+            fetched = False
+        if fetched and _is_image_file_hires(filepath):
+            log(f"  · 无水印原图下载成功（页面 fetch），{os.path.getsize(filepath) // 1024} KB")
+            return True
+        _discard_file(filepath)
+        return False
+
+    # ── 第一档：无水印原图（始终优先）──
+    # fetch 钩子捕获必须在重导航前取走（导航会重置页面 JS 状态）
     captured = []
     try:
         ori = page.eval_js("JSON.stringify(window.__doubao_ori_images||[])")
@@ -404,50 +516,70 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
         captured.extend(page.get_captured_images() or [])
     except CDPError:
         pass
-    captured.reverse()  # 最新的原图优先
 
     seen = set()
     candidates = []
-    for item in list(router_urls) + captured:
+    # ① _ROUTER_DATA 的 image_ori 直链（按本镜文件 ID 匹配，无水印签名现成）
+    try:
+        router_urls = _router_ori_urls(page, own_fid)
+    except CDPError as e:
+        log(f"  · _ROUTER_DATA 读取异常: {e}")
+        router_urls = []
+    for url in [_candidate_url(u) for u in router_urls]:
+        if url and url not in seen:
+            seen.add(url)
+            candidates.append(url)
+    # ② fetch 钩子捕获的原图 URL（累积列表，最新在后 -> 翻转后最新优先）
+    captured.reverse()
+    for item in captured:
         url = _candidate_url(item)
         if url and url not in seen:
             seen.add(url)
             candidates.append(url)
+    # ③ wait_image 返回的本镜 src（可能是缩略图，靠分辨率守卫拦截后继续）
+    if own_src and own_src not in seen:
+        candidates.append(own_src)
 
     for url in candidates:
-        if _direct_download_image(page, url, filepath) and _is_image_file(filepath):
-            log(f"  · 无水印原图下载成功（直链），{os.path.getsize(filepath) // 1024} KB")
+        if _try_download(url):
             _forget_captured(page)
             return filepath
-        _discard_file(filepath)
-        try:
-            fetched = page.download_via_fetch(url, filepath, timeout=30)
-        except CDPError:
-            fetched = False
-        if fetched and _is_image_file(filepath):
-            log(f"  · 无水印原图下载成功（页面 fetch），{os.path.getsize(filepath) // 1024} KB")
-            _forget_captured(page)
-            return filepath
-        _discard_file(filepath)
 
-    if candidates:
+    # 刚生成的图不在当前首屏数据：重导航会话页让服务端收录，再提取一轮
+    if _reload_session(page):
+        try:
+            router_urls = _router_ori_urls(page, own_fid)
+        except CDPError:
+            router_urls = []
+        for url in [_candidate_url(u) for u in router_urls]:
+            if url and url not in seen:
+                if _try_download(url):
+                    _forget_captured(page)
+                    return filepath
+        log("  · 无水印原图候选均无效（含重导航重试），转带水印兜底…")
+    elif candidates:
         log("  · 无水印原图候选均无效，转带水印兜底…")
     else:
         log("  · 未捕获到无水印原图 URL，转带水印兜底…")
 
     # ── 第二档：带水印页面资源（兜底）──
-    src = (img_info or {}).get("src") or ""
+    src = own_src
     page_src = _largest_gen_image_src(page)
-    # wait_image 返回的 src 被截断到 200 字符，用页面完整 URL 补全
-    if src and page_src and page_src.startswith(src[:80]):
+    # 2026-10-24 实测：wait_image 返回的是 320x320 的缩略图 src，
+    # 而页面里同时存在 2848x1600 的原图 <img>。CDN 用同一个 URL 也能返回原图，
+    # 所以必须优先用「页面中像素最大的那张」的 URL —— 否则只下到 70KB 缩略图。
+    # 原判断 page_src.startswith(src[:80]) 在两图路径不同（rc_gen_image/xxx.jpeg
+    # vs xxx.png）时恒为 False，导致永远拿缩略图。
+    if page_src:
         src = page_src
-    elif not src:
-        src = page_src
+    elif src and "rc_gen_image" not in src:
+        # 回落到 wait_image 的 src，但它不是生成图（豆包静态装饰图等）—— 不可用
+        log("  ! 页面未找到生成图（仅静态资源），下载跳过")
+        return None
     if not src:
         log("  ! 页面未找到可用图片 src")
         return None
     log(f"  · 带水印下载: {src[:80]}…")
-
     # blob: 只能页面内 fetch 取回 base64
     if src.startswith("blob:"):
         try:
@@ -470,7 +602,7 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
             if isinstance(res, dict) and res.get("b64"):
                 with open(filepath, "wb") as f:
                     f.write(base64.b64decode(res["b64"]))
-                if _is_image_file(filepath):
+                if _is_image_file_hires(filepath):
                     log(f"  · 带水印下载成功（blob fetch），{os.path.getsize(filepath) // 1024} KB")
                     return filepath
         except (CDPError, ValueError):
@@ -480,7 +612,7 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
 
     # 1) Python 直链（urllib + Cookie + Referer）
     if src.startswith(("http://", "https://")):
-        if _direct_download_image(page, src, filepath) and _is_image_file(filepath):
+        if _direct_download_image(page, src, filepath) and _is_image_file_hires(filepath):
             log(f"  · 带水印下载成功（直链），{os.path.getsize(filepath) // 1024} KB")
             return filepath
         _discard_file(filepath)
@@ -490,7 +622,7 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
         fetched = page.download_via_fetch(src, filepath, timeout=30)
     except CDPError:
         fetched = False
-    if fetched and _is_image_file(filepath):
+    if fetched and _is_image_file_hires(filepath):
         log(f"  · 带水印下载成功（页面 fetch），{os.path.getsize(filepath) // 1024} KB")
         return filepath
     _discard_file(filepath)
@@ -500,7 +632,7 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
         native = page.download_native(src, filepath, timeout=60)
     except CDPError:
         native = False
-    if native and _is_image_file(filepath):
+    if native and _is_image_file_hires(filepath):
         log(f"  · 带水印下载成功（download_native），{os.path.getsize(filepath) // 1024} KB")
         return filepath
     _discard_file(filepath)
@@ -510,7 +642,7 @@ def _download_image_impl(page: CDPPage, outdir: str, name: str, tag: str,
         raw = page.download_raw(src, filepath, timeout=60)
     except CDPError:
         raw = False
-    if raw and _is_image_file(filepath):
+    if raw and _is_image_file_hires(filepath):
         log(f"  · 带水印下载成功（download_raw），{os.path.getsize(filepath) // 1024} KB")
         return filepath
     _discard_file(filepath)
