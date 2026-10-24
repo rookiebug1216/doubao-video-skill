@@ -126,8 +126,9 @@ def test_ensure_video_mode_documented_disabled():
 # ──────────────────────────────────────────────────────────────
 
 def test_render_timeout_value():
-    """RENDER_TIMEOUT == 900（15 分钟，避免误杀已出片但还在排队的镜头）。"""
-    assert doubao_gen.RENDER_TIMEOUT == 900
+    """RENDER_TIMEOUT == 600（2026-10-24 任务G：900→600，配套三层看门狗：
+    无进展 180s 告警 / 3 轮确认无进展显式退出 / 总超时兜底，杜绝长空等）。"""
+    assert doubao_gen.RENDER_TIMEOUT == 600
 
 
 def test_reply_state_js_contains_quota_patterns():

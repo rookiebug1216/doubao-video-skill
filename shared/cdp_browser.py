@@ -252,6 +252,41 @@ class CDPPage:
         except Exception:
             pass  # timeout or connection error — 正常
 
+    def wait_event(self, method: str, timeout: float):
+        """
+        阻塞等待指定的 CDP 事件（如 Runtime.bindingCalled），超时返回 None。
+
+        事件驱动主循环的原语：替代「sleep + 轮询」，页面内观察器通过
+        Runtime.addBinding 推送事件，本方法在 WS 上等待它到来。
+        等待期间收到的其他事件照常入缓存（不丢失）；对 call 响应的
+        迟到消息直接丢弃（单线程串行模型下无并发 call）。
+        """
+        cached = self.pop_events(method)
+        if cached:
+            return cached[0]
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            try:
+                raw = self.ws.recv_message(remaining)
+            except Exception:
+                return None  # 超时或连接异常
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if "id" not in msg and "method" in msg:
+                if msg.get("method") == method:
+                    return msg
+                self._events.append(msg)
+            # ⚠ 带 id 的消息（call 响应）在此被有意丢弃：单线程串行模型下
+            # call 同步等待响应、wait_event 期间不可能有未决 call，到达的
+            # 只能是已异常失败的 call 的迟到响应（无人认领）。
+            # ⚠ 若未来引入并发 call，此处静默丢弃会造成 call 永久挂起——
+            # 重构时必须先改造为「带 id 消息入缓存 + call 按序认领」。
+
     def eval_js(self, js: str, await_promise: bool = False, recv_timeout: float = 120):
         """执行 JS 并返回值。JS 需为单表达式/IIFE。"""
         res = self.call("Runtime.evaluate", recv_timeout=recv_timeout,

@@ -37,7 +37,7 @@ _ROOT = os.path.normpath(os.path.join(_HERE, "..", "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from shared import cdp_browser, doubao_page, style_presets, media_unlock
+from shared import cdp_browser, doubao_page, style_presets, media_unlock, doubao_events
 from shared.cdp_browser import CDPPage, CDPError, DOUBAO_HOME, _OPENER, log, cookie_header
 from shared.doubao_page import (
     page_ready, login_state, is_logged_in, wait_login,
@@ -48,10 +48,16 @@ from shared.project_manager import ProjectManager, resolve_output_dir
 # 图生图能力已下沉共享内核（角色参考图/关键帧尾帧首帧共用同一条链路）
 from shared import imagegen as char_ref_gen
 
-# 渲染超时（秒）。实测免费档渲染约 6.5 分钟，但晚高峰/重复提交后排队可达 10 分钟以上
-# （曾在 600s 超时退出后才出片），取 15 分钟，避免"片已出、脚本已退"的误杀
-RENDER_TIMEOUT = 900
-POLL_INTERVAL = 5
+# 渲染总超时（秒）。
+# 2026-10-24 任务G：900→600。实测免费档渲染约 5-6.5 分钟（豆包自报"预计等待 5 分钟"），
+# 600s=10 分钟仍有充足缓冲；同时新增三层看门狗（无进展 180s 告警、3 轮确认无进展
+# 显式退出、总超时兜底），不再依赖一刀切长超时空等。
+RENDER_TIMEOUT = 600
+POLL_INTERVAL = 5  # 仅降级模式（观察器失活）使用；事件驱动模式由 MutationObserver 推送驱动
+# 看门狗阈值（秒）：无任何实质进展持续该时长 → 告警 + 诊断输出
+WATCHDOG_IDLE = 180
+# 事件等待窗口（秒）：wait_snapshot 单次阻塞上限，超时进入兜底巡检（检查观察器心跳）
+EVENT_WINDOW = 30
 
 # 跨镜已完成的视频 src 指纹集合。
 # 用于 wait_render 的"基线 src 集合"：上一镜刚完成下载的视频 src 也算基线，
@@ -377,6 +383,11 @@ def _confirm_round_key(state: dict) -> tuple:
 
     同一张卡在流式更新时标题计数不变 → 同一轮（不重复发确认）；
     豆包再次回复一张新卡时标题计数 +1 → 新的一轮（必须再确认，否则镜卡死不出片）。
+
+    ⚠ 仅降级模式（观察器失活走轮询）使用：innerText 累计计数在豆包虚拟化
+    卸载/回载下会漂移（2026-10-24 实证：会话完成后 innerText 仅 1114 字符、
+    卡片计数=0），存在轮次键碰撞 → 漏确认新卡的固有风险。事件驱动模式
+    使用 _find_pending_card 的消息锚点判据，不受虚拟化影响。
     """
     titles = int(state.get("cardTitles", 0) or 0)
     asks = int(state.get("askCount", 0) or 0)
@@ -392,17 +403,156 @@ def _confirm_round_key(state: dict) -> tuple:
                   f"{params.get('ratio')}|{params.get('style')}")
 
 
+# 事件驱动模式：确认文本（送达验证按它匹配新用户消息）
+_CONFIRM_TEXT = "确认，开始生成视频"
+
+
+def _state_from_snapshot(snap: dict) -> dict:
+    """
+    把 doubao_events 快照构造成 read_reply_state 兼容 dict（事件驱动模式数据源）。
+
+    兼容字段：hasCard / card / errors / paidPrompt / replyTail —— 状态 2.5/3 的
+    处理逻辑不变。额外附 msgs（消息锚点列表）供确认分支做锚点判定。
+    """
+    msgs = doubao_events.snapshot_msgs(snap)
+    # B 消息正文：text（前 900 字符）+ tail（>900 时的末 300 字符）。
+    # 长消息（如 prompt 回显）尾部的错误/付费文案不因截断漏检
+    # （审查问题1：降级模式读全量 innerText 无此问题，事件模式需补齐）
+    bot_texts = []
+    for m in msgs:
+        if m.get("r") == "B":
+            t = m.get("text") or ""
+            tail = m.get("tail") or ""
+            bot_texts.append(t + ("\n" + tail if tail else ""))
+    cards = [m for m in msgs if m.get("card")]
+    asks = [m for m in msgs if m.get("ask")]
+    full = "\n".join(bot_texts)
+    # 与 REPLY_STATE_JS 相同的错误规则（Python 版）
+    err_re = re.compile(
+        r"(生成次数[^\n]{0,12}(已用完|用完|不足)|额度[^\n]{0,10}(不足|已用完|已耗尽)|"
+        r"次数[^\n]{0,6}(已用完|用完|耗尽)|免费次数已用完|明天再来|明日再来|"
+        r"审核未通过|不通过审核|内容不(符合|合规|适合)|生成失败|无法生成)")
+    paid_prompt = ("付费额度" in full) and bool(re.search(r"是否继续生成|是否继续", full))
+    errors = [] if paid_prompt else err_re.findall(full)[:10]
+    # 错误收集时 paidPrompt 优先（与 JS 版一致：付费询问场景整页跳过 errors）
+    flat_errors = ["".join(tup) if isinstance(tup, tuple) else str(tup) for tup in errors]
+    return {
+        "hasCard": bool(cards) or bool(asks),
+        "card": (cards[-1].get("text") or "") if cards else "",
+        "msgs": msgs,
+        "errors": flat_errors,
+        "paidPrompt": paid_prompt,
+        "replyTail": bot_texts[-1][-600:] if bot_texts else "",
+    }
+
+
+def _card_fingerprint(card_text: str) -> str:
+    """参数确认卡的内容指纹（模型|时长|比例|风格 四元组）。"""
+    p = parse_confirm_card(card_text or "")
+    return f"{p.get('model')}|{p.get('seconds')}|{p.get('ratio')}|{p.get('style')}"
+
+
+def _find_pending_card(state: dict, anchor_hash, confirmed_card_hashes: set,
+                       confirmed_params: set):
+    """
+    事件驱动模式的新卡判定（不变量 N1/N3 的实现）。
+
+    判据（按优先级）：
+      1. 时序锚点：anchor_hash 是最近一次**已送达**确认的用户消息 hash。
+         卡片消息必须位于 anchor 之后（i > anchor 的当前 idx）才算新卡——
+         同一张卡流式更新（i 不变）与历史旧卡（在 anchor 之前）都不触发。
+      2. anchor 缺席 fallback（被虚拟化卸载，罕见）：参数指纹未见过才算新卡。
+    返回待确认卡消息 dict 或 None。卡片自身的 hash 去重由调用方记录
+    （confirmed_card_hashes：确认成功送达后加入，同一元素绝不重复确认）。
+    """
+    msgs = state.get("msgs") or []
+    cards = [m for m in msgs if m.get("r") == "B" and (m.get("card") or m.get("ask"))]
+    if not cards:
+        return None
+    anchor_idx = None
+    if anchor_hash:
+        for m in msgs:
+            if m.get("h") == anchor_hash:
+                anchor_idx = m.get("i")
+                break
+    for c in cards:
+        if c.get("h") in confirmed_card_hashes:
+            continue  # 这张卡已确认过（同元素流式更新也不重复）
+        if anchor_idx is not None:
+            if c.get("i", -1) > anchor_idx:
+                return c  # anchor 之后的新卡 → 待确认
+            # anchor 之前的卡 = 历史旧卡（N3：绝不确认）
+        else:
+            # anchor 被卸载的 fallback：参数指纹判据
+            if _card_fingerprint(c.get("text") or "") not in confirmed_params:
+                return c
+    return None
+
+
+def send_confirmation_verified(page: CDPPage, timeout: float = 10.0):
+    """
+    确认 + 送达验证（不变量 N2/L2 的实现，2026-10-24 任务G）。
+
+    「确认动作完成」的定义从「我发了」升级为「豆包收到了」：
+      - 文本路径：发送后等待一条**新的**用户消息（DOM 中出现含确认文本的
+        send_message）——证明消息真的提交进了会话，而非 Enter 换行的假成功。
+      - 按钮路径：CDP 真实鼠标点击成功后，等待页面发生一次实质状态迁移
+        （观察器指纹去重后的事件：卡片变化/新消息/视频注入）。
+
+    返回 (action, delivered, anchor_hash)：
+      action      'button:…' / 'text' / 'none'
+      delivered   送达验证是否通过（False 时调用方不得锁定轮次，应重试）
+      anchor_hash 文本路径送达时的新用户消息 hash（后续新卡判定的时序锚点）；
+                  按钮路径为 None（按卡片 hash 锁定）
+    """
+    # 送达基线：发送前已存在的用户消息 hash 集合 + 含确认文本的 U 消息条数
+    # （计数判新：同文本确认消息 hash 必碰撞，2026-10-24 E2E 镜7 实锤加固）
+    base_snap = doubao_events.poll_snapshot(page)
+    base_msgs = doubao_events.snapshot_msgs(base_snap)
+    known_hashes = {m.get("h") for m in base_msgs if m.get("r") == "U"}
+    known_count = sum(1 for m in base_msgs
+                      if m.get("r") == "U" and _CONFIRM_TEXT in (m.get("text") or ""))
+    action = send_confirmation(page)
+    if action == "none":
+        return "none", False, None
+    if action == "text":
+        h = doubao_events.wait_user_msg_confirm(page, _CONFIRM_TEXT, known_hashes,
+                                                timeout, known_count=known_count)
+        return action, (h is not None), h
+    # 按钮路径：等待一次实质状态迁移事件（指纹去重过的事件才算）
+    snap = doubao_events.wait_snapshot(page, timeout)
+    return action, (snap is not None), None
+
+
 def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = None,
                 expect_style_key: str | None = None,
                 timeout: int = RENDER_TIMEOUT,
                 prev_known_srcs: set[str] | None = None,
                 allow_paid: bool = False):
     """
-    回复驱动的渲染等待（状态机）：每轮先读豆包实际回复，再决定下一步——
+    事件驱动的渲染等待状态机（2026-10-24 任务G 重构；用户指正：旧 5s 轮询
+    在确认失效后后台空等到 900s 超时，且 innerText 计数判据在豆包虚拟化
+    卸载下漂移导致二次确认漏确认）。
+
+    数据源（双模式）：
+      事件模式（主）：页面内 MutationObserver 观察 message-list，快照指纹
+        去重后经 Runtime.addBinding 推送（debounce 300ms，L1：<2s 响应）；
+        wait_snapshot 阻塞等待；30s 事件窗口静默时做兜底巡检 + 观察器心跳
+        判活（失活自动降级轮询）。
+      降级模式：观察器注入失败/心跳超时 → 回退旧 read_reply_state 轮询
+        （POLL_INTERVAL=5s，轮次键判据），日志明确标注「降级」。
+
+    确认状态机（事件模式用消息锚点制，替代 innerText 累计计数）：
+      新卡判定（_find_pending_card）：卡片消息位于「最近一次已送达确认」
+        锚点之后 且 该卡 hash 未确认过 → 不变量 N1（同卡绝不重复确认）、
+        N3（旧卡绝不确认）；anchor 被卸载时退参数指纹判据。
+      确认完成（send_confirmation_verified）：送达验证通过才算 → 不变量
+        N2（未验证送达绝不锁定轮次）、L2（<=10s 完成验证）。
+      上限：N4 确认 <=3 轮；看门狗：L4 无进展 180s 告警、L5 3 轮确认且
+        页面无响应显式退出、L6 总超时 RENDER_TIMEOUT 兜底。
 
       1. 出现新的 <video>（时长>=3s）      -> (视频信息, None)
-      2. 回复为「视频生成参数确认」卡       -> 解析参数并核对，自动确认
-         （豆包可能二次、三次要求确认，最多确认 3 轮，每轮只发一次）
+      2. 「视频生成参数确认」卡             -> 解析核对参数，自动确认（最多 3 轮）
       3. 额度耗尽文案（不论新旧）           -> (None, "quota")，全局致命，调用方应中断整批
          其他新增错误（审核/失败）          -> (None, None)，本镜失败
       4. 超时                               -> (None, None)
@@ -410,14 +560,17 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     deadline = time.time() + timeout
     last_report = 0
     confirm_count = 0
-    # 参数卡去重（实测教训：朴素"每轮见到卡就确认"曾对同一张卡连发 3 条确认消息）。
-    # 判据是「确认轮次」而不是卡片位置：累计出现第 N 张卡/第 N 次催确认就算新的一轮，
-    # 同一张卡流式更新时计数不变，不会重复确认。
-    # 为什么不能用确认锁：豆包在收到第一次确认后，可能重新规划并再回一张参数卡，
-    # 若一锁到底就会永远不确认、镜卡死不出片（2026-10-23 用户截图实锤）。
+    # ── 降级模式的轮次键判据（事件模式不用；见 _confirm_round_key 警示）──
     confirmed_rounds: set = set()              # 已确认过的轮次键
     clicked_buttons: set[str] = set()
     confirm_fail = 0                           # 连续确认失败次数（防止无限重试）
+    # ── 事件模式的锚点判据状态 ──
+    anchor_hash = None                         # 最近一次已送达确认的用户消息 hash
+    confirmed_card_hashes: set = set()         # 已确认卡的元素 hash（N1）
+    confirmed_params: set = set()              # 已确认卡的参数指纹（anchor 卸载 fallback）
+    # ── 看门狗（L4/L5）──
+    last_progress = time.time()                # 最近一次实质进展（事件/心跳/状态迁移）
+    progress_warned = False
     # 提交时刻的回复基线：
     #  - 历史错误不算"新增"；
     #  - 上一镜残留的参数卡不许被当成新卡重复确认（连续生成时同一标签同一会话）。
@@ -466,24 +619,99 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
     # 元数据加载。5s 节流避免每轮空打。
     last_kick_ts = 0.0
 
+    # 事件驱动模式武装（任务G）：注入失败自动降级轮询
+    event_armed = doubao_events.arm(page)
+    if event_armed:
+        log("  · 事件驱动模式已启用（MutationObserver 推送，响应 <2s，替代 5s 轮询）")
+        # N3 基线锁定：本镜提示词消息（当前最后一条 U 消息）**之前**的所有卡片
+        # 都算历史旧卡，预先加入 confirmed 集合，绝不重复确认。
+        # 双重防误锁：只锁 i < 提示词 idx 的卡——即使豆包已秒回本镜新卡
+        # （i > 提示词 idx，物理上新消息元素）也不会被误锁进基线
+        # （2026-10-24 教训的锚点制版：旧轮次键制不能预锁是因为计数会碰撞，
+        #  hash 制预锁的只是提交前已存在的物理元素，本镜新卡必然是新 hash）
+        try:
+            _base_snap = doubao_events.poll_snapshot(page)
+            _base_msgs = doubao_events.snapshot_msgs(_base_snap)
+            _prompt_idx = max((m.get("i", -1) for m in _base_msgs if m.get("r") == "U"),
+                              default=-1)
+            for _m in _base_msgs:
+                if _m.get("r") == "B" and (_m.get("card") or _m.get("ask")) \
+                        and _m.get("i", -1) < _prompt_idx:
+                    confirmed_card_hashes.add(_m.get("h"))
+                    confirmed_params.add(_card_fingerprint(_m.get("text") or ""))
+            if confirmed_card_hashes:
+                log(f"  · 已锁定 {len(confirmed_card_hashes)} 张历史卡片（N3 基线，"
+                    f"绝不重复确认）")
+        except Exception:
+            pass
+    else:
+        log("  ! 观察器注入失败，自动降级为轮询模式（5s）")
+    last_poll_sig = None  # 兜底巡检的快照指纹（用于判断是否实质变化）
+
     while time.time() < deadline:
         try:
-            data = page.eval_js("""
-            (()=>{
-              const vids=[...document.querySelectorAll('video')];
-              const info=vids.map(v=>({
-                dur: v.duration && isFinite(v.duration) ? v.duration : 0,
-                ready: v.readyState,
-                src: (v.currentSrc||v.src||'')
-              }));
-              return JSON.stringify({
-                n: vids.length,
-                vids: info,
-                hasSpinner: /生成中|正在生成|渲染中|创作中/.test(document.body.innerText||'')
-              });
-            })()
-            """)
-            data = json.loads(data) if isinstance(data, str) else (data or {})
+            # ── 数据源层（双模式）──
+            if event_armed:
+                _win = min(EVENT_WINDOW, max(1.0, deadline - time.time()))
+                snap = doubao_events.wait_snapshot(page, _win)
+                if snap is not None:
+                    # 指纹去重后的推送事件 = 实质状态迁移（新消息/卡片变化/视频注入）
+                    last_progress = time.time()
+                    progress_warned = False
+                else:
+                    # 事件窗口静默：兜底巡检 + 观察器心跳判活
+                    if doubao_events.is_alive(page):
+                        # 心跳新鲜 = DOM 仍在变化（渲染 spinner 等），不算空等
+                        last_progress = time.time()
+                        progress_warned = False
+                    else:
+                        event_armed = False
+                        log("  ! 观察器心跳超时（60s 无活动），自动降级为轮询模式")
+                    snap = doubao_events.poll_snapshot(page)
+                    _sig = json.dumps([(m.get("h"), m.get("n")) for m in
+                                       doubao_events.snapshot_msgs(snap)], ensure_ascii=False)
+                    if _sig != last_poll_sig:
+                        last_poll_sig = _sig
+                        last_progress = time.time()  # 巡检发现实质变化
+                state = _state_from_snapshot(snap) if snap else read_reply_state(page)
+                _videos = doubao_events.snapshot_videos(snap)
+                data = {
+                    "n": len(_videos),
+                    "vids": _videos,
+                    "hasSpinner": bool(re.search(
+                        r"生成中|正在生成|渲染中|创作中", state.get("replyTail", ""))),
+                }
+            else:
+                # 降级模式：旧轮询路径（read_reply_state + 5s 间隔）
+                snap = None
+                data = page.eval_js("""
+                (()=>{
+                  const vids=[...document.querySelectorAll('video')];
+                  const info=vids.map(v=>({
+                    dur: v.duration && isFinite(v.duration) ? v.duration : 0,
+                    ready: v.readyState,
+                    src: (v.currentSrc||v.src||'')
+                  }));
+                  return JSON.stringify({
+                    n: vids.length,
+                    vids: info,
+                    hasSpinner: /生成中|正在生成|渲染中|创作中/.test(document.body.innerText||'')
+                  });
+                })()
+                """)
+                data = json.loads(data) if isinstance(data, str) else (data or {})
+                state = read_reply_state(page)
+
+            # ── 看门狗（L4/L5）：无进展告警 + 3 轮确认且页面无响应显式退出 ──
+            if time.time() - last_progress > WATCHDOG_IDLE:
+                if not progress_warned:
+                    progress_warned = True
+                    log(f"  ! 看门狗：{WATCHDOG_IDLE}s 无任何进展（无事件/心跳/状态变化）")
+                    log(f"      确认轮次 {confirm_count}/3，模式：{'事件驱动' if event_armed else '轮询降级'}")
+                    log(f"      豆包回复尾部: {read_doubao_reply(page)[:200]}")
+                if confirm_count >= 3:
+                    log("  ! 已确认 3 轮且页面无响应，显式退出本镜（不等总超时，L5）")
+                    return None, None
 
             # 状态1：基线外的新视频（时长>=3s 且 src 不在提交时基线里）即本镜完成
             vids = data.get("vids", [])
@@ -571,11 +799,9 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                     except CDPError:
                         pass
 
-            # 读豆包实际回复
-            state = read_reply_state(page)
-
             # 实时监控豆包回复：按句号/换行切分尾部 600 字符，只打印新句子
             # 流式输出期间每个新句子打印一次，避免日志爆炸；seen_sentences 上限 100 防内存涨
+            # 注：state 已在数据源层构造（事件模式来自快照、降级模式来自 read_reply_state）
             reply_tail = state.get("replyTail", "") or ""
             if reply_tail and reply_tail != last_reply_tail:
                 last_reply_tail = reply_tail
@@ -637,14 +863,28 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                     return None, "paid"
 
             # 状态2：参数确认卡 → 解析核对 → 自动确认（豆包可能要求多轮确认）
-            # 去重主键是「确认轮次」：第 N 张标题 / 第 N 次催确认各算一轮；
-            # 定位不到标题与催确认句时，才退回参数字段指纹（不能用 700 字原始卡片
-            # 文本，其尾部随流式输出不断增长，指纹每轮都变）。
-            card_text = state.get("card", "") or ""
-            params = parse_confirm_card(card_text)
-            round_key = _confirm_round_key(state)
-            is_new_round = bool(state.get("hasCard")) and round_key not in confirmed_rounds
+            # 双判据：事件模式用消息锚点制（_find_pending_card，不受虚拟化卸载影响，
+            # 不变量 N1/N3）；降级模式沿用轮次键制（innerText 计数，有已知漂移风险）。
+            if event_armed:
+                pending = _find_pending_card(state, anchor_hash,
+                                             confirmed_card_hashes, confirmed_params)
+                card_text = (pending.get("text") or "") if pending else ""
+                round_key = None
+                is_new_round = pending is not None
+            else:
+                pending = None
+                card_text = state.get("card", "") or ""
+                round_key = _confirm_round_key(state)
+                # 卡片指纹去重（N1 在降级模式的补全，2026-10-24 E2E 镜6 实锤：
+                # innerText 计数漂移把豆包回放的同一张卡判为新轮次 → 多发一条
+                # 确认，靠豆包幂等才没多扣额度）。已确认过同参数指纹的卡不再确认；
+                # 残余风险（豆包要求确认参数完全相同的第二张卡，极罕见）由
+                # 180s 看门狗告警 + 600s 总超时兜底。
+                is_new_round = bool(state.get("hasCard")) \
+                    and round_key not in confirmed_rounds \
+                    and _card_fingerprint(card_text) not in confirmed_params
             if is_new_round and confirm_count < 3:
+                params = parse_confirm_card(card_text)
                 log("  · 豆包回复「视频生成参数确认」卡：")
                 if params.get("model"):
                     log(f"      模型 {params['model']}")
@@ -662,25 +902,52 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                             re.search(r"卡通|动漫|Q版|皮克斯|赛璐璐|3D动画", s):
                         warn = "  ⚠ 与你设定的写实仿真人风格不一致，豆包可能沿用了卡通风格"
                     log(f"      风格 {s}{warn}")
-                action = send_confirmation(page)
-                if action != "none":
-                    # 只有真正确认成功才锁定本轮 —— 2026-10-24 修复：
-                    # 原先无论成败都先 confirmed_rounds.add(round_key)，
-                    # 一旦首次确认失败（合成 click 无效 / 文本没发出去），
-                    # 后续 is_new_round 恒为 False → 永远不再重试，
-                    # 镜卡死在"确认后我再开始生成视频"处直到超时。
-                    confirmed_rounds.add(round_key)
+                # 确认 + 送达验证（N2/L2）：完成定义从「我发了」升级为「豆包收到了」
+                action, delivered, new_anchor = send_confirmation_verified(page)
+                if action != "none" and delivered:
                     confirm_count += 1
                     confirm_fail = 0
-                    log(f"  · 已自动确认第 {confirm_count} 轮（{action}），等待渲染开始")
-                    time.sleep(2)
+                    last_progress = time.time()
+                    log(f"  · 已自动确认第 {confirm_count} 轮（{action}，送达已验证），"
+                        f"等待渲染开始")
+                    # 锁定本轮：事件模式锁卡片 hash + 时序锚点；降级模式锁轮次键
+                    if event_armed:
+                        if pending is not None:
+                            confirmed_card_hashes.add(pending.get("h"))
+                            confirmed_params.add(_card_fingerprint(card_text))
+                        if new_anchor:
+                            anchor_hash = new_anchor
+                    else:
+                        confirmed_rounds.add(round_key)
+                        # 降级模式同步锁指纹（回放卡去重的另一半，见上方注释）
+                        confirmed_params.add(_card_fingerprint(card_text))
                     # 卡片确认后再找一次"确认生成"按钮（可能需要二次按钮点击）；
                     # 只做按钮探测，禁止再发文本消息
                     action2 = send_confirmation(page, allow_text=False)
                     if action2 != "none" and action2.startswith("button"):
                         confirm_count += 1
                         log(f"  · 二次确认按钮: {action2}")
+                        last_progress = time.time()
                         time.sleep(3)
+                elif action != "none" and not delivered:
+                    # 已发出但送达验证未通过：不锁定轮次（N2），将重试。
+                    # 重试有理论上的重复发送风险，但 wait_user_msg_confirm 是
+                    # 事件+poll 双通道检测，漏检概率远低于 submit 假成功概率
+                    # （2026-10-23 实锤卡死根因），且 5 次上限防无限重发。
+                    confirm_fail += 1
+                    if action.startswith("button") and event_armed and pending is not None:
+                        # 按钮路径防重复点击：点击已执行但页面无反应，锁定该卡
+                        # （重复点击确认按钮的重复提交风险 > 等待风险），靠看门狗兜底
+                        confirmed_card_hashes.add(pending.get("h"))
+                        confirmed_params.add(_card_fingerprint(card_text))
+                        log(f"  ! 按钮已点击但页面无实质响应（第 {confirm_fail} 次），"
+                            f"已锁定该卡防止重复点击，等待看门狗判定")
+                    else:
+                        log(f"  ! 确认已发出但送达验证未通过（第 {confirm_fail} 次），"
+                            f"不锁定轮次，将重试")
+                    if confirm_fail >= 5:
+                        log("  ! 送达验证连续 5 次失败，放弃本镜（防重复发送多扣额度）")
+                        return None, None
                 else:
                     confirm_fail += 1
                     log(f"  ! 本轮确认未成功，将重试（不锁定轮次）"
@@ -734,7 +1001,10 @@ def wait_render(page: CDPPage, before_count: int, expect_seconds: int | None = N
                 last_report = time.time()
         except CDPError:
             pass
-        time.sleep(POLL_INTERVAL)
+        # 节奏控制：事件模式由 wait_snapshot 阻塞等事件（不 sleep，响应 <2s）；
+        # 降级模式保持 5s 轮询间隔
+        if not event_armed:
+            time.sleep(POLL_INTERVAL)
 
     return None, None
 
@@ -1222,6 +1492,17 @@ def main():
     ap.add_argument("--skip-keyframes", action="store_true",
                     help="v3：跳过关键帧图生成阶段（直接用已有 keyframes_state.json）")
     args = ap.parse_args()
+
+    # 跨智能体防踩坑（2026-10-24 E2E 实锤）：直接传 shots.json 路径而未传
+    # --project-root 时，输出会落到 ./manju_videos 默认目录（参考图/关键帧
+    # 状态全部丢失，镜间首帧锚点断裂）。从标准项目结构自动推导：shots.json
+    # 位于 <项目根>/storyboard/*.shots.json 时，项目根 = 其父目录的父目录。
+    if not args.project_root and args.shots_json:
+        _sj_parent = os.path.dirname(os.path.abspath(args.shots_json))
+        # 大小写不敏感（Windows 路径不区分大小写，跨智能体可能传大写变体）
+        if os.path.basename(_sj_parent).lower() == "storyboard":
+            args.project_root = os.path.dirname(_sj_parent)
+            log(f"· 从分镜路径推导项目根: {args.project_root}")
 
     # 解析输出目录和项目管理器
     out_dir, pm = resolve_output_dir(args.project_root, args.out)
